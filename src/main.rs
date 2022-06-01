@@ -45,7 +45,7 @@ struct Message {
 
 struct Update {
     msg: Rumor,
-    sends: u8,
+    sends: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -154,11 +154,15 @@ impl Node {
     fn gossip(&mut self) -> [Option<Rumor>; PIGGYBACKED_MSGS] {
         let mut msgs = 0;
         let mut resp = [None; PIGGYBACKED_MSGS];
+        let N = (self.membership.len() + 2) as f32;
+        let max_sends = 3 * N.log10().ceil() as usize;
+        // From the paper
+        self.suspicion_period = self.gossip_interval * max_sends;
         while msgs < PIGGYBACKED_MSGS {
             if let Some(mut update) = self.updates.pop_front() {
                 let dm = update.msg.clone();
                 update.sends += 1;
-                if update.sends < 3 {
+                if update.sends < max_sends {
                     self.updates.push_back(update);
                 }
                 resp[msgs] = Some(dm);
@@ -176,14 +180,7 @@ impl Node {
             "Simulator bug; sent {:?} to the wrong node",
             msg
         );
-        for rumor in msg.gossip.iter() {
-            if let Some(ref rumor) = rumor {
-                self.process_gossip(rumor);
-            } else {
-                break;
-            }
-        }
-        match msg.kind {
+        let resp = match msg.kind {
             MsgKind::Ping => Some(Message {
                 recipient: sender,
                 kind: MsgKind::Ack(self.id),
@@ -207,7 +204,7 @@ impl Node {
             }
             MsgKind::Ack(node) => {
                 if !self.pings.contains_key(&node) || !self.membership.contains_key(&node) {
-                    info!("{}: unknown ack {:?}", self.id, msg);
+                    info!("{}: unexpected ack from {}", self.id, node);
                     return None;
                 }
                 let (state, ts) = self.membership.get_mut(&node).unwrap();
@@ -238,7 +235,17 @@ impl Node {
                     None
                 }
             }
+        };
+
+        for rumor in msg.gossip.iter() {
+            if let Some(ref rumor) = rumor {
+                self.process_gossip(rumor);
+            } else {
+                break;
+            }
         }
+
+        resp
     }
     pub fn tick(&mut self) -> Vec<Message> {
         self.tick += 1;
@@ -289,9 +296,11 @@ impl Node {
                     continue;
                 }
                 // late, send ping_req to k nodes
+                // FIXME: this won't work when the size of the group is 1
                 let mut chosen = HashSet::new();
                 let mut rng = thread_rng();
-                let subgroup_sz = self.pingreq_subgroup_sz.min(self.memberlist.len() - 1);
+                let subgroup_sz = self.pingreq_subgroup_sz.min(self.memberlist.len());
+                assert!(subgroup_sz > 1, "I know it fails at this point");
                 while chosen.len() < subgroup_sz {
                     let recipient = self.memberlist.choose(&mut rng).unwrap();
                     if *recipient != *node && !chosen.contains(recipient) {
@@ -312,6 +321,9 @@ impl Node {
         }
         for msg in msgs.iter_mut() {
             msg.gossip = self.gossip();
+        }
+        if self.membership.is_empty() {
+            return Vec::new();
         }
 
         let ping_rcpt = self.memberlist[self.last_pinged];
@@ -369,15 +381,13 @@ struct Args {
     /// Gossip interval in ticks
     #[clap(short, long, default_value_t = 6)]
     gossip_interval: usize,
-
-    /// Suspicion period in ticks
-    #[clap(short, long, default_value_t = 12)]
-    suspicion_period: usize,
 }
 
 fn main() {
     env_logger::init();
     let args = Args::parse();
+    let N = (args.n + 1) as f32;
+    let sus_period = 3 * N.log10().ceil() as usize;
     let mut nodes: HashMap<usize, Node> = (0..args.n)
         .map(|i| {
             (
@@ -390,7 +400,7 @@ fn main() {
                     last_pinged: args.n,
                     ping_interval: args.rtt,
                     gossip_interval: args.gossip_interval,
-                    suspicion_period: args.suspicion_period,
+                    suspicion_period: sus_period,
                     memberlist: Vec::new(),
                     updates: VecDeque::new(),
                     membership: HashMap::new(),
