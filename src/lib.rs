@@ -7,20 +7,24 @@ use rand::thread_rng;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
+    mem::take,
 };
 
 /// Node states
-#[derive(PartialEq, Debug, Copy, Clone)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum Command {
     Alive,
     Suspect,
     Failed,
+    // Send our state and request that the other do the same
+    Pull(Vec<Peer>),
+    Push(Vec<Peer>),
     // How to handle custom user commands?
-    User(u8),
+    // User(u8, [u8; 512]),
 }
 
 /// Dissemination Messages
-#[derive(PartialEq, Debug, Copy, Clone)]
+#[derive(PartialEq, Debug, Clone)]
 struct Rumor {
     node: usize,
     ts: usize,
@@ -43,7 +47,7 @@ pub struct Message {
     pub recipient: usize,
     pub kind: MsgKind,
     // TODO: how can I support arbitrary messages?
-    gossip: [Option<Rumor>; PIGGYBACKED_MSGS],
+    gossip: Vec<Rumor>,
 }
 
 struct Update {
@@ -65,7 +69,23 @@ struct Ping {
     sent_at: usize,
 }
 
-pub struct Node {
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum PeerState {
+    Alive,
+    Suspect,
+    Failed,
+    Left,
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub struct Peer {
+    id: usize,
+    // addr: TODO
+    state: PeerState,
+    last_state_update: usize,
+}
+
+pub struct Server {
     pub id: usize,
     tick: usize,
     clock: usize,
@@ -79,17 +99,17 @@ pub struct Node {
     last_pinged: usize,
     memberlist: Vec<usize>,
     /// Node id -> (State, timestamp the state was updated)
-    membership: HashMap<usize, (Command, usize)>,
+    membership: HashMap<usize, Peer>,
     outbox: Vec<Message>,
 }
 
-impl Display for Node {
+impl Display for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Node({}, {})", self.id, self.clock)
     }
 }
 
-impl Node {
+impl Server {
     pub fn new(
         id: usize,
         ping_interval: usize,
@@ -97,7 +117,7 @@ impl Node {
         gossip_interval: usize,
         suspicion_period: usize,
     ) -> Self {
-        Node {
+        Server {
             id,
             clock: 0,
             tick: 0,
@@ -135,6 +155,10 @@ impl Node {
         } else {
             PingState::Normal
         };
+        info!(
+            "{}@{} pinging {} for {}",
+            self.id, self.tick, node, recipient
+        );
         self.pings.insert(
             node,
             Ping {
@@ -145,30 +169,56 @@ impl Node {
         );
     }
 
+    pub fn live_members(&self) -> Vec<usize> {
+        self.membership
+            .iter()
+            .filter(|(_, peer)| peer.state == PeerState::Alive)
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    fn rm_node(&mut self, node: usize) {
+        if let Some(_) = self.membership.remove(&node) {
+            let mut idx = usize::MAX;
+            for (i, n) in self.memberlist.iter().enumerate() {
+                if *n == node {
+                    idx = i;
+                    break;
+                }
+            }
+            assert!(idx != usize::MAX);
+            self.memberlist.swap_remove(idx);
+        }
+    }
+
+    fn add_node(&mut self, node: usize) {
+        info!("{}@{} discovered {}", self.id, self.tick, node);
+        let mut rng = thread_rng();
+        let n: usize = rng.gen_range(0..=self.memberlist.len());
+        self.memberlist.insert(n, node);
+        self.membership.insert(
+            node,
+            Peer {
+                id: node,
+                state: PeerState::Alive,
+                last_state_update: self.clock,
+            },
+        );
+    }
+
     /// Add a peer to our network. The peer is not reflected in the member list
     /// until it has responded to a ping.
     pub fn add_peer(&mut self, id: usize) {
         if self.membership.contains_key(&id) {
             return;
         }
-        self.memberlist.push(id);
-        self.membership.insert(id, (Command::Alive, self.clock));
-        self.updates.push_front(Update {
-            msg: Rumor {
-                node: id,
-                ts: self.clock,
-                command: Command::Suspect,
-            },
-            sends: 0,
-        });
         self.ping(id, self.id);
     }
 
     fn process_gossip(&mut self, rumor: &Rumor) {
-        match rumor.command {
-            Command::User(_tag) => {
-                todo!()
-            }
+        match &rumor.command {
+            Command::Pull(_memberlist) => {}
+            Command::Push(_memberlist) => {}
             Command::Alive => {
                 if rumor.node == self.id {
                     self.clock += 1;
@@ -176,14 +226,14 @@ impl Node {
                         msg: rumor.clone(),
                         sends: 0,
                     });
-                } else if let Some((state, ts)) = self.membership.get(&rumor.node) {
-                    assert!(*state != Command::Failed);
-                    if rumor.ts > *ts {
-                        if *state != Command::Alive {
-                            info!("{} marking {} as Alive", self.id, rumor.node);
+                } else if let Some(peer) = self.membership.get_mut(&rumor.node) {
+                    assert!(peer.state != PeerState::Failed);
+                    if rumor.ts >= peer.last_state_update {
+                        if peer.state != PeerState::Alive {
+                            info!("{}@{} marking {} as Alive", self.id, self.tick, rumor.node);
                         }
-                        self.membership
-                            .insert(rumor.node, (Command::Alive, rumor.ts));
+                        peer.state = PeerState::Alive;
+                        peer.last_state_update = self.clock;
                         self.updates.push_front(Update {
                             msg: rumor.clone(),
                             sends: 0,
@@ -191,12 +241,7 @@ impl Node {
                     }
                 } else {
                     // new node!
-                    info!("{} discovered {}", self.id, rumor.node);
-                    self.membership
-                        .insert(rumor.node, (Command::Alive, rumor.ts));
-                    let mut rng = thread_rng();
-                    let n: usize = rng.gen_range(0..=self.memberlist.len());
-                    self.memberlist.insert(n, rumor.node);
+                    self.add_node(rumor.node);
                     self.updates.push_front(Update {
                         msg: rumor.clone(),
                         sends: 0,
@@ -214,13 +259,16 @@ impl Node {
                         },
                         sends: 0,
                     });
-                } else if let Some((state, ts)) = self.membership.get(&rumor.node) {
-                    if rumor.ts > *ts {
-                        if *state != Command::Suspect {
-                            info!("{} marking {} as Suspect", self.id, rumor.node);
+                } else if let Some(peer) = self.membership.get_mut(&rumor.node) {
+                    if rumor.ts >= peer.last_state_update {
+                        if peer.state != PeerState::Suspect {
+                            info!(
+                                "{}@{} marking {} as Suspect",
+                                self.id, self.tick, rumor.node
+                            );
                         }
-                        self.membership
-                            .insert(rumor.node, (Command::Suspect, rumor.ts));
+                        peer.state = PeerState::Suspect;
+                        peer.last_state_update = self.clock;
                         self.updates.push_front(Update {
                             msg: rumor.clone(),
                             sends: 0,
@@ -229,50 +277,38 @@ impl Node {
                 }
             }
             Command::Failed => {
-                warn!("{} marking {} as Failed", self.id, rumor.node);
-                if let Some(_) = self.membership.remove(&rumor.node) {
-                    let mut idx = usize::MAX;
-                    for (i, node) in self.memberlist.iter().enumerate() {
-                        if *node == rumor.node {
-                            idx = i;
-                            break;
-                        }
-                    }
-                    assert!(idx != usize::MAX);
-                    self.memberlist.swap_remove(idx);
-                    self.updates.push_front(Update {
-                        msg: rumor.clone(),
-                        sends: 0,
-                    });
-                }
+                warn!("{}@{} marking {} as Failed", self.id, self.tick, rumor.node);
+                self.rm_node(rumor.node);
+                self.updates.push_front(Update {
+                    msg: rumor.clone(),
+                    sends: 0,
+                });
             }
         }
     }
 
-    fn gossip(&mut self) -> [Option<Rumor>; PIGGYBACKED_MSGS] {
-        let mut msgs = 0;
-        let mut resp = [None; PIGGYBACKED_MSGS];
-        let N = (self.membership.len() + 2) as f32;
-        let max_sends = 3 * N.log10().ceil() as usize;
+    fn gossip(&mut self) -> Vec<Rumor> {
+        let mut msgs = Vec::new();
+        let n = (self.membership.len() + 2) as f32;
+        let max_sends = 3 * n.log10().ceil() as usize;
         // From the paper
         self.suspicion_period = self.gossip_interval * max_sends;
-        while msgs < PIGGYBACKED_MSGS {
+        while msgs.len() < PIGGYBACKED_MSGS {
             if let Some(mut update) = self.updates.pop_front() {
                 let dm = update.msg.clone();
                 update.sends += 1;
                 if update.sends < max_sends {
                     self.updates.push_back(update);
                 }
-                resp[msgs] = Some(dm);
-                msgs += 1;
+                msgs.push(dm);
             } else {
                 break;
             }
         }
-        return resp;
+        msgs
     }
 
-    // FIXME report higher-level things here like "Failed"
+    // TODO report higher-level things here like "Failed"
     pub fn process(&mut self, sender: usize, msg: Message) {
         self.clock += 1;
         assert_eq!(
@@ -287,14 +323,14 @@ impl Node {
                 self.ping(node, sender);
             }
             MsgKind::Ack(node) => {
-                if !self.pings.contains_key(&node) || !self.membership.contains_key(&node) {
-                    debug!("{}: unexpected ack from {}", self.id, node);
+                if !self.pings.contains_key(&node) {
+                    debug!("{}@{} unexpected ack from {}", self.id, self.tick, node);
                     return;
                 }
-                if let Some((state, ts)) = self.membership.get_mut(&node) {
-                    if state != &Command::Failed && self.clock > *ts {
-                        *state = Command::Alive;
-                        *ts = self.clock;
+                if let Some(peer) = self.membership.get_mut(&node) {
+                    if peer.state != PeerState::Failed && self.clock > peer.last_state_update {
+                        peer.state = PeerState::Alive;
+                        peer.last_state_update = self.clock;
                         self.updates.push_front(Update {
                             msg: Rumor {
                                 node,
@@ -305,9 +341,7 @@ impl Node {
                         });
                     }
                 } else {
-                    // New node!
-                    // TODO: relay up the chain
-                    self.membership.insert(node, (Command::Alive, self.clock));
+                    self.add_node(node);
                     self.updates.push_front(Update {
                         msg: Rumor {
                             node,
@@ -329,11 +363,7 @@ impl Node {
         };
 
         for rumor in msg.gossip.iter() {
-            if let Some(ref rumor) = rumor {
-                self.process_gossip(rumor);
-            } else {
-                break;
-            }
+            self.process_gossip(rumor);
         }
     }
 
@@ -346,7 +376,8 @@ impl Node {
         }
 
         let mut to_rm = Vec::new();
-        for (node, ping) in self.pings.iter_mut() {
+        let mut pings = take(&mut self.pings);
+        for (node, ping) in pings.iter_mut() {
             if self.tick > (ping.sent_at + self.suspicion_period) {
                 assert!(ping.state == PingState::Forwarded);
                 self.updates.push_front(Update {
@@ -377,8 +408,8 @@ impl Node {
             {
                 if ping.state != PingState::Normal {
                     debug!(
-                        "{}: expire ping from {} to {}",
-                        self.id, ping.requester, node
+                        "{}@{} expire ping from {} to {}",
+                        self.id, self.tick, ping.requester, node
                     );
                     to_rm.push(*node);
                     continue;
@@ -388,7 +419,10 @@ impl Node {
                 let mut rng = thread_rng();
                 let subgroup_sz = self.pingreq_subgroup_sz.min(self.memberlist.len());
                 if self.memberlist.len() <= 1 {
-                    debug!("{} suspects that {} has failed", self.id, node);
+                    debug!(
+                        "{}@{} suspects that {} has failed",
+                        self.id, self.tick, node
+                    );
                     to_rm.push(*node);
                     self.updates.push_front(Update {
                         msg: Rumor {
@@ -401,13 +435,13 @@ impl Node {
                     continue;
                 }
                 while chosen.len() < subgroup_sz {
-                    let recipient = self.memberlist.choose(&mut rng).unwrap();
-                    if *recipient != *node && !chosen.contains(recipient) {
-                        chosen.insert(*recipient);
+                    let recipient = *self.memberlist.choose(&mut rng).unwrap();
+                    if recipient != *node && !chosen.contains(&recipient) {
+                        chosen.insert(recipient);
                         let m = Message {
-                            recipient: *recipient,
+                            recipient,
                             kind: MsgKind::PingReq(*node),
-                            gossip: [None; PIGGYBACKED_MSGS],
+                            gossip: self.gossip(),
                         };
                         self.outbox.push(m);
                     }
@@ -415,15 +449,25 @@ impl Node {
                 ping.state = PingState::Forwarded;
             }
         }
+        self.pings = pings;
         for node in to_rm {
-            debug!("{}: expire ping to {}", self.id, node);
+            debug!("{}@{} expire ping to {}", self.id, self.tick, node);
             self.pings.remove(&node);
         }
         if !self.membership.is_empty() {
+            assert!(
+                !self.memberlist.is_empty(),
+                "membership {:?}\nmemberlist {:?}",
+                self.membership,
+                self.memberlist
+            );
             let ping_rcpt = self.memberlist[self.last_pinged];
             self.ping(ping_rcpt, self.id);
             self.last_pinged += 1;
         }
-        std::mem::replace(&mut self.outbox, Vec::new())
+        take(&mut self.outbox)
     }
 }
+
+#[cfg(test)]
+mod test {}

@@ -5,7 +5,7 @@ use clap::Parser;
 use rand::prelude::*;
 use rand::thread_rng;
 use std::collections::HashMap;
-use swimmer::{Command, Message, Node};
+use swimmer::{Command, Message, Server};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -34,25 +34,24 @@ struct Args {
     #[clap(long, default_value_t = 0.00)]
     p_add: f32,
 
-    /// Message round-trip-time in ticks.
-    #[clap(short, long, default_value_t = 1)]
+    /// Message round-trip-time in ticks. Each
+    #[clap(short, long, default_value_t = 2)]
     rtt: usize,
 
     /// Gossip interval in ticks
-    #[clap(short, long, default_value_t = 6)]
+    #[clap(short, long, default_value_t = 12)]
     gossip_interval: usize,
 }
 
 fn main() {
     env_logger::init();
     let args = Args::parse();
-    let N = (args.n + 1) as f32;
-    let sus_period = 3 * N.log10().ceil() as usize;
-    let mut nodes: HashMap<usize, Node> = (0..args.n)
+    let sus_period = args.gossip_interval * 3 * ((args.n + 1) as f32).log10().ceil() as usize;
+    let mut nodes: HashMap<usize, Server> = (0..args.n)
         .map(|i| {
             (
                 i,
-                Node::new(i, args.rtt, args.k, args.gossip_interval, sus_period),
+                Server::new(i, args.rtt, args.k, args.gossip_interval, sus_period),
             )
         })
         .collect();
@@ -77,7 +76,6 @@ fn main() {
             let node = nodes.get_mut(&msg.recipient).unwrap();
             node.process(sender, msg);
         }
-
         for node in nodes.values_mut() {
             for msg in node.tick().into_iter() {
                 next_msgs.push((node.id, msg));
