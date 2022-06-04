@@ -1,0 +1,7 @@
+#+title: Todo
+
+* TODO Bound the amount of gossip we piggy-back
+* TODO Implement Push/Pull as an anti-entropy mechanism
+* TODO Add TCP & UDP probing as a separate layer
+* TODO Implement adaptive timeouts (Lifeguard's LHA)
+* TODO Add user commands
