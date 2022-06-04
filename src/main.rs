@@ -93,7 +93,7 @@ fn main() {
             }
             trace!("{:03} -- {:?} -> {:03}", sender, msg.kind, msg.recipient);
             let node = nodes.get_mut(&msg.recipient).unwrap();
-            node.process(sender, msg);
+            node.process(msg);
         }
         for node in nodes.values_mut() {
             for msg in node.tick().into_iter() {

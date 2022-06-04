@@ -6,3 +6,4 @@
 * TODO Implement adaptive timeouts (Lifeguard's LHA)
 * TODO Add user commands
 * TODO implement event delegation
+* TODO dedupe broadcasts. Use a heap or a btree or something to sort them and check to see if we already have the (message, incarnation) pair tracked
