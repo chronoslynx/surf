@@ -5,7 +5,7 @@ use clap::Parser;
 use rand::prelude::*;
 use rand::thread_rng;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use swimmer::{Message, Server};
 
 #[derive(Parser, Debug)]
@@ -41,13 +41,14 @@ struct Args {
 
     /// Gossip interval in ticks
     #[clap(short, long, default_value_t = 12)]
-    gossip_interval: usize,
+    failure_detection_interval: usize,
 }
 
 fn main() {
     env_logger::init();
     let args = Args::parse();
-    let sus_period = args.gossip_interval * 3 * ((args.n + 1) as f32).log10().ceil() as usize;
+    let sus_period =
+        args.failure_detection_interval * 3 * ((args.n + 1) as f32).log10().ceil() as usize;
     let base_port: u16 = 32000;
     let mut nodes: HashMap<usize, Server> = (0..args.n)
         .map(|id| {
@@ -55,11 +56,13 @@ fn main() {
                 id,
                 Server::new(
                     id,
-                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                    base_port + id as u16,
+                    SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                        base_port + id as u16,
+                    ),
                     args.rtt,
                     args.k,
-                    args.gossip_interval,
+                    args.failure_detection_interval,
                     sus_period,
                 ),
             )
@@ -68,8 +71,10 @@ fn main() {
     for id in 1..args.n {
         nodes.get_mut(&0).unwrap().add_peer(
             id,
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            base_port + id as u16,
+            SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                base_port + id as u16,
+            ),
         );
     }
     info!("Created cluster of {} nodes", args.n);

@@ -9,14 +9,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
     mem::take,
-    net::{self, IpAddr},
+    net::{self, IpAddr, SocketAddr},
 };
 
 /// Node states
 #[derive(PartialEq, Debug, Clone)]
 pub enum RumorKind {
     /// Alive messages also deliver details for new peers
-    Alive(IpAddr, u16),
+    Alive(SocketAddr),
     Suspect,
     Failed,
     Depart,
@@ -27,29 +27,26 @@ pub enum RumorKind {
     // User(u8, [u8; 512]),
 }
 
-/// Dissemination Messages
+/// Rumors disseminated on top of normal gossip
 #[derive(PartialEq, Debug, Clone)]
 struct Rumor {
     /// ID of the node this rumor is about
     peer_id: usize,
     kind: RumorKind,
     incarnation: usize,
-    // payload?
 }
 
 /// Failure Detector messages. These piggy-back higher level data
 #[derive(Debug)]
 pub enum MsgKind {
     // Ping(sender_id, sender_ip, sender_port)
-    Ping(usize, IpAddr, u16),
+    Ping(usize, SocketAddr),
     Ack(usize, usize),
     PingReq {
         target_id: usize,
-        target_ip: IpAddr,
-        target_port: u16,
+        target: SocketAddr,
         sender_id: usize,
-        sender_ip: IpAddr,
-        sender_port: u16,
+        sender: SocketAddr,
     },
 }
 
@@ -77,8 +74,7 @@ enum PingState {
 
 #[derive(Debug)]
 struct Ping {
-    ip: IpAddr,
-    port: u16,
+    addr: SocketAddr,
     requester: usize,
     state: PingState,
     sent_at: usize,
@@ -95,18 +91,16 @@ pub enum PeerState {
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub struct Peer {
     id: usize,
-    ip: net::IpAddr,
-    port: u16,
+    addr: SocketAddr,
     state: PeerState,
     incarnation: usize,
 }
 
 impl Peer {
-    fn new(id: usize, ip: IpAddr, port: u16, incarnation: usize) -> Peer {
+    fn new(id: usize, addr: SocketAddr, incarnation: usize) -> Peer {
         Peer {
             id,
-            ip,
-            port,
+            addr,
             state: PeerState::Alive,
             incarnation,
         }
@@ -117,21 +111,20 @@ impl fmt::Display for Peer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Peer({}, {}:{}, {:?}, {})",
-            self.id, self.ip, self.port, self.state, self.incarnation
+            "Peer({}, {}, {:?}, {})",
+            self.id, self.addr, self.state, self.incarnation
         )
     }
 }
 
 pub struct Server {
     pub id: usize,
-    ip: net::IpAddr,
-    port: u16,
+    addr: SocketAddr,
     tick: usize,
     incarnation: usize,
     pingreq_subgroup_sz: usize,
     ping_interval: usize,
-    gossip_interval: usize,
+    failure_detection_interval: usize,
     suspicion_period: usize,
     updates: VecDeque<Update>,
     pings: HashMap<usize, Ping>,
@@ -152,8 +145,7 @@ impl Display for Server {
 impl Server {
     pub fn new(
         id: usize,
-        addr: net::IpAddr,
-        port: u16,
+        addr: SocketAddr,
         ping_interval: usize,
         pingreq_subgroup_sz: usize,
         gossip_interval: usize,
@@ -161,14 +153,13 @@ impl Server {
     ) -> Self {
         Server {
             id,
-            ip: addr,
-            port,
+            addr,
             incarnation: 0,
             tick: 0,
             pingreq_subgroup_sz,
             last_pinged: 0,
             ping_interval,
-            gossip_interval,
+            failure_detection_interval: gossip_interval,
             suspicion_period,
             memberlist: Vec::new(),
             updates: VecDeque::new(),
@@ -187,10 +178,10 @@ impl Server {
         self.outbox.push(m);
     }
 
-    fn ping(&mut self, node: usize, ip: IpAddr, port: u16, recipient: usize) {
+    fn ping(&mut self, node: usize, addr: SocketAddr, recipient: usize) {
         let m = Message {
             recipient: node,
-            kind: MsgKind::Ping(self.id, self.ip, self.port),
+            kind: MsgKind::Ping(self.id, self.addr),
             // TODO: if node is `suspect` then spread that gossip!
             gossip: self.gossip(),
         };
@@ -207,8 +198,7 @@ impl Server {
         self.pings.insert(
             node,
             Ping {
-                ip,
-                port,
+                addr,
                 requester: recipient,
                 state,
                 sent_at: self.tick,
@@ -224,12 +214,12 @@ impl Server {
             .collect()
     }
 
-    fn add(&mut self, id: usize, ip: IpAddr, port: u16, incarnation: usize) {
+    fn add(&mut self, id: usize, addr: SocketAddr, incarnation: usize) {
         if self.membership.contains_key(&id) {
             debug!("{:03} already knows of {:03}", self.id, id);
             return;
         }
-        let peer = Peer::new(id, ip, port, incarnation);
+        let peer = Peer::new(id, addr, incarnation);
         info!("{:03}@{} discovered {:03}", self.id, self.tick, peer);
         let mut rng = thread_rng();
         let n: usize = rng.gen_range(0..=self.memberlist.len());
@@ -239,11 +229,11 @@ impl Server {
 
     /// Add a peer to our network. The peer is not reflected in the member list
     /// until it has responded to a ping.
-    pub fn add_peer(&mut self, id: usize, ip: IpAddr, port: u16) {
+    pub fn add_peer(&mut self, id: usize, addr: SocketAddr) {
         if self.membership.contains_key(&id) {
             return;
         }
-        self.ping(id, ip, port, self.id);
+        self.ping(id, addr, self.id);
     }
 
     fn process_gossip(&mut self, rumor: &Rumor) {
@@ -251,7 +241,7 @@ impl Server {
             RumorKind::Depart => {}
             RumorKind::Pull(_memberlist) => {}
             RumorKind::Push(_memberlist) => {}
-            RumorKind::Alive(ip, port) => {
+            RumorKind::Alive(addr) => {
                 if rumor.peer_id == self.id {
                     self.incarnation += 1;
                     self.updates.push_front(Update {
@@ -273,7 +263,7 @@ impl Server {
                         });
                     }
                 } else {
-                    self.add(rumor.peer_id, *ip, *port, rumor.incarnation);
+                    self.add(rumor.peer_id, *addr, rumor.incarnation);
                     self.updates.push_front(Update {
                         msg: rumor.clone(),
                         sends: 0,
@@ -287,7 +277,7 @@ impl Server {
                         msg: Rumor {
                             peer_id: self.id,
                             incarnation: self.incarnation,
-                            kind: RumorKind::Alive(self.ip, self.port),
+                            kind: RumorKind::Alive(self.addr),
                         },
                         sends: 0,
                     });
@@ -334,7 +324,7 @@ impl Server {
         let n = (self.membership.len() + 2) as f32;
         let max_sends = 3 * n.log10().ceil() as usize;
         // From the paper
-        self.suspicion_period = self.gossip_interval * max_sends;
+        self.suspicion_period = self.failure_detection_interval * max_sends;
         while msgs.len() < PIGGYBACKED_MSGS {
             if let Some(mut update) = self.updates.pop_front() {
                 let dm = update.msg.clone();
@@ -358,21 +348,19 @@ impl Server {
             msg
         );
         match msg.kind {
-            MsgKind::Ping(sender_id, sender_ip, sender_port) => {
-                self.add(sender_id, sender_ip, sender_port, 0);
+            MsgKind::Ping(sender_id, sender_addr) => {
+                self.add(sender_id, sender_addr, 0);
                 self.ack(self.id, sender_id);
             }
             MsgKind::PingReq {
                 target_id,
-                target_ip,
-                target_port,
+                target,
                 sender_id,
-                sender_ip,
-                sender_port,
+                sender,
             } => {
                 assert!(target_id != self.id);
-                self.add(sender_id, sender_ip, sender_port, 0);
-                self.ping(target_id, target_ip, target_port, sender_id);
+                self.add(sender_id, sender, 0);
+                self.ping(target_id, target, sender_id);
             }
             MsgKind::Ack(peer_id, incarnation) => {
                 if !self.pings.contains_key(&peer_id) {
@@ -380,8 +368,7 @@ impl Server {
                     return;
                 }
                 let Ping {
-                    ip,
-                    port,
+                    addr,
                     requester,
                     state: _state,
                     sent_at: _sent_at,
@@ -398,18 +385,18 @@ impl Server {
                             msg: Rumor {
                                 peer_id,
                                 incarnation,
-                                kind: RumorKind::Alive(peer.ip, peer.port),
+                                kind: RumorKind::Alive(peer.addr),
                             },
                             sends: 0,
                         });
                     }
                 } else {
-                    self.add(peer_id, ip, port, incarnation);
+                    self.add(peer_id, addr, incarnation);
                     self.updates.push_front(Update {
                         msg: Rumor {
                             peer_id,
                             incarnation,
-                            kind: RumorKind::Alive(ip, port),
+                            kind: RumorKind::Alive(addr),
                         },
                         sends: 0,
                     });
@@ -445,7 +432,7 @@ impl Server {
                     sends: 0,
                 });
                 to_rm.push(*node);
-            } else if self.tick > (ping.sent_at + self.gossip_interval) {
+            } else if self.tick > (ping.sent_at + self.failure_detection_interval) {
                 // At this point we throw out pings for non-member peers.
                 if ping.state == PingState::FromElsewhere || !self.membership.contains_key(node) {
                     to_rm.push(*node);
@@ -505,11 +492,9 @@ impl Server {
                             recipient,
                             kind: MsgKind::PingReq {
                                 target_id: *node,
-                                target_ip: ping.ip,
-                                target_port: ping.port,
+                                target: ping.addr,
                                 sender_id: self.id,
-                                sender_ip: self.ip,
-                                sender_port: self.port,
+                                sender: self.addr,
                             },
                             gossip: self.gossip(),
                         };
@@ -534,7 +519,7 @@ impl Server {
             );
             let ping_rcpt = self.memberlist[self.last_pinged];
             let ping_peer = self.membership.get(&ping_rcpt).unwrap().clone();
-            self.ping(ping_rcpt, ping_peer.ip, ping_peer.port, self.id);
+            self.ping(ping_rcpt, ping_peer.addr, self.id);
             self.last_pinged += 1;
         }
         take(&mut self.outbox)

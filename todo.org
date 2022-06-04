@@ -5,3 +5,4 @@
 * TODO Add TCP & UDP probing as a separate layer
 * TODO Implement adaptive timeouts (Lifeguard's LHA)
 * TODO Add user commands
+* TODO implement event delegation
