@@ -11,6 +11,7 @@ use std::{
     fmt::Display,
     mem::take,
     net::SocketAddr,
+    time::{Duration, Instant},
 };
 
 /// Node states
@@ -32,11 +33,6 @@ struct Rumor {
     peer_id: usize,
     kind: RumorKind,
     incarnation: usize,
-}
-
-enum AntiEntropy {
-    Push(Vec<Peer>),
-    Pull(Vec<Peer>),
 }
 
 struct BroadcastStore {
@@ -75,15 +71,14 @@ impl BroadcastStore {
 /// Failure Detector messages. These piggy-back higher level data
 #[derive(Debug)]
 pub enum MsgKind {
-    // Ping(sender_id, sender_ip, sender_port)
-    Ping(usize, SocketAddr),
+    Ping,
     Ack(usize, usize),
     PingReq {
         target_id: usize,
         target: SocketAddr,
-        sender_id: usize,
-        sender: SocketAddr,
     },
+    Push(Vec<Peer>),
+    Pull(Vec<Peer>),
 }
 
 const PIGGYBACKED_MSGS: usize = 10;
@@ -91,14 +86,19 @@ const PIGGYBACKED_MSGS: usize = 10;
 #[derive(Debug)]
 pub struct Message {
     pub recipient: usize,
+    pub sender_id: usize,
+    pub sender: SocketAddr,
+    pub seq_no: usize,
     pub kind: MsgKind,
-    // TODO: how can I support arbitrary messages?
+    // FIXME separate this from the failure detector messages
+    // Gossip shuold be pulled by whatever does the networking work...
+    // so it can manage packing
     gossip: Vec<Rumor>,
 }
 
 #[derive(PartialEq, Eq)]
 struct Broadcast {
-    // TODO we probably don't need this...
+    // TODO store serialized rumor only
     msg: Rumor,
     serialized: Vec<u8>,
     id: usize,
@@ -132,11 +132,12 @@ enum PingState {
 }
 
 #[derive(Debug)]
-struct Ping {
+struct PendingPing {
     addr: SocketAddr,
+    seq_no: usize,
     requester: usize,
     state: PingState,
-    sent_at: usize,
+    sent_at: Instant,
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -156,11 +157,11 @@ pub struct Peer {
 }
 
 impl Peer {
-    fn new(id: usize, addr: SocketAddr, incarnation: usize) -> Peer {
+    fn new(id: usize, addr: SocketAddr, incarnation: usize, state: PeerState) -> Peer {
         Peer {
             id,
             addr,
-            state: PeerState::Alive,
+            state,
             incarnation,
         }
     }
@@ -179,19 +180,20 @@ impl fmt::Display for Peer {
 pub struct Server {
     pub id: usize,
     addr: SocketAddr,
-    tick: usize,
+    seq_no: usize,
     incarnation: usize,
     pingreq_subgroup_sz: usize,
-    ping_interval: usize,
-    failure_detection_interval: usize,
-    suspicion_period: usize,
+    ping_interval: Duration,
+    protocol_period: Duration,
+    suspicion_period: Duration,
     broadcasts: BroadcastStore,
-    pings: HashMap<usize, Ping>,
+    pings: HashMap<usize, PendingPing>,
     // Index into memberlist
     last_pinged: usize,
     memberlist: Vec<usize>,
     /// Node id -> (State, timestamp the state was updated)
     membership: HashMap<usize, Peer>,
+    // FIXME we need something better than this. Maybe a callback? another delegate, I mean
     outbox: Vec<Message>,
 }
 
@@ -205,19 +207,19 @@ impl Server {
     pub fn new(
         id: usize,
         addr: SocketAddr,
-        ping_interval: usize,
+        ping_interval: Duration,
         pingreq_subgroup_sz: usize,
-        gossip_interval: usize,
-        suspicion_period: usize,
+        gossip_interval: Duration,
+        suspicion_period: Duration,
     ) -> Self {
         Server {
             id,
             addr,
             pingreq_subgroup_sz,
             ping_interval,
-            failure_detection_interval: gossip_interval,
+            protocol_period: gossip_interval,
             suspicion_period,
-            tick: 0,
+            seq_no: 1,
             incarnation: 1,
             broadcasts: BroadcastStore::new(),
             pings: HashMap::new(),
@@ -231,68 +233,87 @@ impl Server {
     fn ack(&mut self, node: usize, recipient: usize) {
         let m = Message {
             recipient,
+            sender_id: self.id,
+            sender: self.addr,
+            seq_no: self.seq_no,
             kind: MsgKind::Ack(node, self.incarnation),
             gossip: self.gossip(),
         };
+        self.seq_no = self.seq_no.wrapping_add(1);
         self.outbox.push(m);
     }
 
     fn ping(&mut self, node: usize, addr: SocketAddr, recipient: usize) {
         let m = Message {
             recipient: node,
-            kind: MsgKind::Ping(self.id, self.addr),
+            sender_id: self.id,
+            sender: self.addr,
+            seq_no: self.seq_no,
+            kind: MsgKind::Ping,
             // TODO: if node is `suspect` then spread that gossip!
             gossip: self.gossip(),
         };
-        self.outbox.push(m);
+        self.seq_no = self.seq_no.wrapping_add(1);
         let state = if recipient != self.id {
             PingState::FromElsewhere
         } else {
             PingState::Normal
         };
-        debug!(
-            "{}@{} pinging {} for {}",
-            self.id, self.tick, node, recipient
-        );
+        debug!("{:03} pinging {} for {}", self.id, node, recipient);
         self.pings.insert(
             node,
-            Ping {
+            PendingPing {
                 addr,
+                seq_no: m.seq_no,
                 requester: recipient,
                 state,
-                sent_at: self.tick,
+                sent_at: Instant::now(),
             },
         );
+        self.outbox.push(m);
     }
 
-    pub fn live_members(&self) -> Vec<usize> {
-        self.membership
-            .iter()
-            .filter(|(_, peer)| peer.state == PeerState::Alive)
-            .map(|(k, _)| *k)
-            .collect()
+    pub fn current_membership(&self) -> Vec<Peer> {
+        let peer_self = Peer::new(self.id, self.addr, self.incarnation, PeerState::Alive);
+        let mut peers = Vec::with_capacity(1 + self.membership.len());
+        peers.push(peer_self);
+        for peer in self.membership.values() {
+            peers.push(peer.clone());
+        }
+        peers
     }
 
-    fn add(&mut self, id: usize, addr: SocketAddr, incarnation: usize) {
-        if self.membership.contains_key(&id) {
-            debug!("{:03} already knows of {:03}", self.id, id);
+    fn remember(&mut self, id: usize, addr: SocketAddr, incarnation: usize, state: PeerState) {
+        if let Some(peer) = self.membership.get_mut(&id) {
+            if incarnation > peer.incarnation {
+                peer.incarnation = incarnation;
+                peer.state = state;
+            }
+        } else {
+            let peer = Peer::new(id, addr, incarnation, state);
+            info!("{:03} discovered {:03}", self.id, peer);
+            let mut rng = thread_rng();
+            let n: usize = rng.gen_range(0..=self.memberlist.len());
+            self.memberlist.insert(n, peer.id);
+            self.membership.insert(peer.id, peer);
+        }
+    }
+
+    /// Join a cluster the specified peer belongs to
+    pub fn join(&mut self, peer_id: usize, addr: SocketAddr) {
+        if self.membership.contains_key(&peer_id) {
             return;
         }
-        let peer = Peer::new(id, addr, incarnation);
-        info!("{:03}@{} discovered {:03}", self.id, self.tick, peer);
-        let mut rng = thread_rng();
-        let n: usize = rng.gen_range(0..=self.memberlist.len());
-        self.memberlist.insert(n, peer.id);
-        self.membership.insert(peer.id, peer);
-    }
 
-    /// Add a peer to our network. The peer is not reflected in the member list
-    /// until it has responded to a ping.
-    pub fn add_peer(&mut self, id: usize, addr: SocketAddr) {
-        if self.membership.contains_key(&id) {
-            return;
-        }
-        self.ping(id, addr, self.id);
+        let m = Message {
+            recipient: peer_id,
+            sender_id: self.id,
+            sender: self.addr,
+            seq_no: 0,
+            kind: MsgKind::Pull(Vec::new()),
+            gossip: Vec::new(),
+        };
+        self.outbox.push(m);
     }
 
     fn process_gossip(&mut self, rumor: &Rumor) {
@@ -307,14 +328,14 @@ impl Server {
                         if peer.state == PeerState::Failed {
                             // rejoin!
                         } else if peer.state != PeerState::Alive {
-                            info!("{:03}@{} marking {:03} as Alive", self.id, self.tick, peer);
+                            info!("{:03} marking {:03} as Alive", self.id, peer);
                         }
                         peer.state = PeerState::Alive;
                         peer.incarnation = rumor.incarnation;
                         self.broadcasts.push(rumor.clone());
                     }
                 } else {
-                    self.add(rumor.peer_id, *addr, rumor.incarnation);
+                    self.remember(rumor.peer_id, *addr, rumor.incarnation, PeerState::Alive);
                     self.broadcasts.push(rumor.clone());
                 }
             }
@@ -329,10 +350,7 @@ impl Server {
                 } else if let Some(peer) = self.membership.get_mut(&rumor.peer_id) {
                     if rumor.incarnation > peer.incarnation {
                         if peer.state != PeerState::Suspect {
-                            info!(
-                                "{:03}@{} marking {:03} as Suspect",
-                                self.id, self.tick, peer
-                            );
+                            info!("{:03} marking {:03} as Suspect", self.id, peer);
                         }
                         peer.state = PeerState::Suspect;
                         peer.incarnation = rumor.incarnation;
@@ -342,7 +360,7 @@ impl Server {
             }
             RumorKind::Failed => {
                 if let Some(peer) = self.membership.remove(&rumor.peer_id) {
-                    warn!("{}@{} marking {} as Failed", self.id, self.tick, peer);
+                    warn!("{:03} marking {:03} as Failed", self.id, peer);
                     let mut idx = usize::MAX;
                     for (i, n) in self.memberlist.iter().enumerate() {
                         if *n == rumor.peer_id {
@@ -362,14 +380,14 @@ impl Server {
     fn gossip(&mut self) -> Vec<Rumor> {
         let mut msgs = Vec::new();
         let n = (self.membership.len() + 2) as f32;
-        let max_sends = 3 * n.log10().ceil() as usize;
+        let max_sends = 3 * n.log10().ceil() as u32;
         // From the paper
-        self.suspicion_period = self.failure_detection_interval * max_sends;
+        self.suspicion_period = self.protocol_period * max_sends;
         // FIXME peek and check size first
         while msgs.len() < PIGGYBACKED_MSGS {
             if let Some(update) = self.broadcasts.pop() {
                 let dm = update.msg.clone();
-                if update.sends < max_sends - 1 {
+                if update.sends < (max_sends as usize - 1) {
                     self.broadcasts.replay_broadcast(update);
                 }
                 msgs.push(dm);
@@ -387,33 +405,59 @@ impl Server {
             "Simulator bug; sent {:?} to the wrong node",
             msg
         );
+        self.remember(msg.sender_id, msg.sender, 0, PeerState::Alive);
         match msg.kind {
-            MsgKind::Ping(sender_id, sender_addr) => {
-                self.add(sender_id, sender_addr, 0);
-                self.ack(self.id, sender_id);
+            MsgKind::Push(peers) => {
+                // Merge with our state
+                for peer in peers {
+                    self.remember(peer.id, peer.addr, peer.incarnation, peer.state)
+                }
             }
-            MsgKind::PingReq {
-                target_id,
-                target,
-                sender_id,
-                sender,
-            } => {
-                assert!(target_id != self.id);
-                self.add(sender_id, sender, 0);
-                self.ping(target_id, target, sender_id);
+            MsgKind::Pull(peers) => {
+                // Respond with our state in a Push
+                let our_peers = self.current_membership();
+                let m = Message {
+                    recipient: msg.sender_id,
+                    sender_id: self.id,
+                    sender: self.addr,
+                    seq_no: 0,
+                    kind: MsgKind::Push(our_peers),
+                    gossip: self.gossip(),
+                };
+                self.outbox.push(m);
+                for peer in peers {
+                    self.remember(peer.id, peer.addr, peer.incarnation, peer.state)
+                }
+            }
+            MsgKind::Ping => {
+                self.ack(self.id, msg.sender_id);
+            }
+            MsgKind::PingReq { target_id, target } => {
+                if target_id == self.id {
+                    error!(
+                        "{:03} asked to ping-req itself by {:03}",
+                        self.id, msg.sender_id
+                    );
+                    self.ack(self.id, msg.sender_id);
+                } else {
+                    self.ping(target_id, target, msg.sender_id);
+                }
             }
             MsgKind::Ack(peer_id, incarnation) => {
                 if !self.pings.contains_key(&peer_id) {
-                    debug!("{}@{} unexpected ack from {}", self.id, self.tick, peer_id);
+                    debug!("{:03} unexpected ack from {}", self.id, peer_id);
                     return;
                 }
-                let Ping {
+                let PendingPing {
                     addr,
                     requester,
+                    seq_no,
                     state: _state,
                     sent_at: _sent_at,
                 } = self.pings.remove(&peer_id).unwrap();
-                if requester != self.id {
+                if seq_no != msg.seq_no {
+                    return;
+                } else if requester != self.id {
                     self.ack(peer_id, requester);
                 }
 
@@ -428,7 +472,7 @@ impl Server {
                         });
                     }
                 } else {
-                    self.add(peer_id, addr, incarnation);
+                    self.remember(peer_id, addr, incarnation, PeerState::Alive);
                     self.broadcasts.push(Rumor {
                         peer_id,
                         incarnation,
@@ -444,7 +488,6 @@ impl Server {
     }
 
     pub fn tick(&mut self) -> Vec<Message> {
-        self.tick += 1;
         if self.last_pinged >= self.memberlist.len() {
             let mut rng = thread_rng();
             self.memberlist.shuffle(&mut rng);
@@ -453,8 +496,9 @@ impl Server {
 
         let mut to_rm = Vec::new();
         let mut pings = take(&mut self.pings);
+        let now = Instant::now();
         for (node, ping) in pings.iter_mut() {
-            if self.tick > (ping.sent_at + self.suspicion_period) {
+            if now > (ping.sent_at + self.suspicion_period) {
                 assert!(ping.state == PingState::Forwarded);
                 let peer = self.membership.get(node).unwrap();
                 self.broadcasts.push(Rumor {
@@ -463,7 +507,7 @@ impl Server {
                     kind: RumorKind::Failed,
                 });
                 to_rm.push(*node);
-            } else if self.tick > (ping.sent_at + self.failure_detection_interval) {
+            } else if now > (ping.sent_at + self.protocol_period) {
                 // At this point we throw out pings for non-member peers.
                 if ping.state == PingState::FromElsewhere || !self.membership.contains_key(node) {
                     to_rm.push(*node);
@@ -477,12 +521,12 @@ impl Server {
                     kind: RumorKind::Suspect,
                 });
             } else if ping.state != PingState::Forwarded
-                && self.tick > (ping.sent_at + self.ping_interval)
+                && now > (ping.sent_at + self.ping_interval)
             {
                 if ping.state != PingState::Normal {
                     debug!(
-                        "{}@{} expire ping from {} to {}",
-                        self.id, self.tick, ping.requester, node
+                        "{:03} expire ping from {:03} to {:03}",
+                        self.id, ping.requester, node
                     );
                     to_rm.push(*node);
                     continue;
@@ -497,10 +541,7 @@ impl Server {
                     .map(|p| p.incarnation)
                     .unwrap_or(0);
                 if self.memberlist.len() <= 1 {
-                    debug!(
-                        "{}@{} suspects that {} has failed",
-                        self.id, self.tick, node
-                    );
+                    debug!("{:03} suspects that {:03} has failed", self.id, node);
                     to_rm.push(*node);
                     self.broadcasts.push(Rumor {
                         peer_id: *node,
@@ -515,11 +556,12 @@ impl Server {
                         chosen.insert(recipient);
                         let m = Message {
                             recipient,
+                            sender_id: self.id,
+                            sender: self.addr,
+                            seq_no: ping.seq_no,
                             kind: MsgKind::PingReq {
                                 target_id: *node,
                                 target: ping.addr,
-                                sender_id: self.id,
-                                sender: self.addr,
                             },
                             gossip: self.gossip(),
                         };
@@ -531,7 +573,7 @@ impl Server {
         }
         self.pings = pings;
         for node in to_rm {
-            debug!("{}@{} expire ping to {}", self.id, self.tick, node);
+            debug!("{:03} expire ping to {}", self.id, node);
             self.pings.remove(&node);
         }
         if !self.membership.is_empty() {

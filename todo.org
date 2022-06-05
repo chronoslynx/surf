@@ -1,9 +1,15 @@
 #+title: Todo
 
-* TODO Bound the amount of gossip we piggy-back
-* TODO Implement Push/Pull as an anti-entropy mechanism
-* TODO Add TCP & UDP probing as a separate layer
+* DONE Implement Push/Pull as an anti-entropy mechanism
+* TODO Periodically push/pull state with a random node
+* TODO dedupe broadcasts. Use a heap or a btree or something to sort them and check to see if we already have the (message, incarnation) pair tracked
+* TODO Add TCP & UDP probing and test
+- [ ] Probe over udp
+- [ ] Probe over TCP
+- [ ] Push/pull periodically over TCP
+- [ ] Bound the amount of gossip we piggy-back
+- [ ] Fork off a process per server and a thread for each of the TCP, UDP, and timers
 * TODO Implement adaptive timeouts (Lifeguard's LHA)
 * TODO Add user commands
 * TODO implement event delegation
-* TODO dedupe broadcasts. Use a heap or a btree or something to sort them and check to see if we already have the (message, incarnation) pair tracked
+* TODO borrow sane defaults from [[https://github.com/hashicorp/memberlist/blob/master/config.go#L298][memberlist]]

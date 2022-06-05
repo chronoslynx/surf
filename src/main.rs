@@ -2,6 +2,7 @@
 extern crate log;
 
 use clap::Parser;
+use humantime;
 use rand::prelude::*;
 use rand::thread_rng;
 use std::collections::HashMap;
@@ -19,7 +20,7 @@ struct Args {
     #[clap(short, long, default_value_t = 3)]
     k: usize,
 
-    /// Probability that a message will be delayed by another tick
+    /// Probability that a message will be delayed by a round
     #[clap(long, default_value_t = 0.05)]
     p_delay: f32,
 
@@ -27,28 +28,20 @@ struct Args {
     #[clap(long, default_value_t = 0.01)]
     p_loss: f32,
 
-    /// Per-tick probability of node failure
-    #[clap(long, default_value_t = 0.01)]
-    p_fail: f32,
+    /// Message round-trip-time
+    #[clap(short, long)]
+    rtt: humantime::Duration,
 
-    /// Probability with which a new node will be introduced each tick
-    #[clap(long, default_value_t = 0.00)]
-    p_add: f32,
-
-    /// Message round-trip-time in ticks. Each
-    #[clap(short, long, default_value_t = 2)]
-    rtt: usize,
-
-    /// Gossip interval in ticks
-    #[clap(short, long, default_value_t = 12)]
-    failure_detection_interval: usize,
+    /// How often the failure detection protocol should run
+    #[clap(short, long)]
+    protocol_period: humantime::Duration,
 }
 
 fn main() {
     env_logger::init();
     let args = Args::parse();
-    let sus_period =
-        args.failure_detection_interval * 3 * ((args.n + 1) as f32).log10().ceil() as usize;
+    let ival: std::time::Duration = args.protocol_period.into();
+    let sus_period = ival * 3 * ((args.n + 1) as f32).log10().ceil() as u32;
     let base_port: u16 = 32000;
     let mut nodes: HashMap<usize, Server> = (0..args.n)
         .map(|id| {
@@ -60,21 +53,18 @@ fn main() {
                         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                         base_port + id as u16,
                     ),
-                    args.rtt,
+                    args.rtt.into(),
                     args.k,
-                    args.failure_detection_interval,
+                    args.protocol_period.into(),
                     sus_period,
                 ),
             )
         })
         .collect();
     for id in 1..args.n {
-        nodes.get_mut(&0).unwrap().add_peer(
-            id,
-            SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                base_port + id as u16,
-            ),
+        nodes.get_mut(&id).unwrap().join(
+            0,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), base_port),
         );
     }
     info!("Created cluster of {} nodes", args.n);
