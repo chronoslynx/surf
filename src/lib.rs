@@ -44,6 +44,16 @@ pub enum PeerState {
     Failed,
 }
 
+impl From<RumorKind> for PeerState {
+    fn from(rk: RumorKind) -> Self {
+        match rk {
+            RumorKind::Alive(_) => PeerState::Alive,
+            RumorKind::Suspect => PeerState::Suspect,
+            RumorKind::Failed => PeerState::Failed,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub struct Peer {
     id: usize,
@@ -59,6 +69,23 @@ impl Peer {
             addr,
             state,
             incarnation,
+        }
+    }
+
+    fn rumor_kind(&self) -> RumorKind {
+        match self.state {
+            PeerState::Alive => RumorKind::Alive(self.addr),
+            PeerState::Failed => RumorKind::Failed,
+            PeerState::Suspect => RumorKind::Suspect,
+        }
+    }
+
+    /// Create a rumor about this peer's current state
+    fn rumor(&self) -> Rumor {
+        Rumor {
+            peer_id: self.id,
+            incarnation: self.incarnation,
+            kind: self.rumor_kind(),
         }
     }
 }
@@ -170,6 +197,7 @@ impl Server {
     }
 
     fn ping(&mut self, node: usize, addr: SocketAddr, recipient: usize) {
+        assert_ne!(node, self.id, "Attempted to ping ourselves");
         let m = Message {
             protocol_version: PROTOCOL_VERSION,
             recipient: node,
@@ -203,7 +231,7 @@ impl Server {
         self.outbox.push(m);
     }
 
-    pub fn current_membership(&self) -> Vec<Peer> {
+    pub fn live_members(&self) -> Vec<Peer> {
         let peer_self = Peer::new(self.id, self.addr, self.incarnation, PeerState::Alive);
         let mut peers = Vec::with_capacity(1 + self.membership.len());
         peers.push(peer_self);
@@ -213,24 +241,55 @@ impl Server {
         peers
     }
 
-    fn remember(&mut self, id: usize, addr: SocketAddr, incarnation: usize, state: PeerState) {
-        if let Some(peer) = self.membership.get_mut(&id) {
-            if incarnation >= peer.incarnation {
-                peer.incarnation = incarnation;
-                peer.state = state;
+    /// Apply new information to the specified peer state machine.
+    fn upsert_peer(&mut self, peer_id: usize, incarnation: usize, rumor_kind: RumorKind) {
+        assert_ne!(peer_id, self.id, "We should handle ourselves elsewhere");
+        if let Some(peer) = self.membership.get_mut(&peer_id) {
+            if incarnation < peer.incarnation {
+                return;
             }
-        } else {
-            let peer = Peer::new(id, addr, incarnation, state);
+            peer.incarnation = incarnation;
+            let state = rumor_kind.into();
+            if peer.state == state {
+                self.broadcasts.push(peer.rumor());
+                return;
+            }
+            info!(
+                "{:03} update peer {:03}: {:?} -> {:?}",
+                self.id, peer.id, peer.state, state
+            );
+            if peer.state == PeerState::Failed {
+                // we actually have to probe them now
+                let mut rng = thread_rng();
+                let n: usize = rng.gen_range(0..=self.memberlist.len());
+                self.memberlist.insert(n, peer.id);
+            } else if state == PeerState::Failed {
+                // dont bother probing failed peers
+                let mut idx = usize::MAX;
+                for (i, n) in self.memberlist.iter().enumerate() {
+                    if *n == peer_id {
+                        idx = i;
+                        break;
+                    }
+                }
+                assert!(idx != usize::MAX);
+                self.memberlist.swap_remove(idx);
+            }
+            peer.state = state;
+            self.broadcasts.push(peer.rumor());
+        } else if let RumorKind::Alive(addr) = rumor_kind {
+            let peer = Peer::new(peer_id, addr, incarnation, rumor_kind.into());
             info!("{:03} discovered {:03}", self.id, peer);
             let mut rng = thread_rng();
             let n: usize = rng.gen_range(0..=self.memberlist.len());
             self.memberlist.insert(n, peer.id);
             self.membership.insert(peer.id, peer);
+            self.broadcasts.push(peer.rumor());
         }
     }
 
     /// Join a cluster the specified peer belongs to
-    /// FIXME tie messages to addresses
+    /// FIXME tie messages to addresses!
     pub fn join(&mut self, peer_id: usize, addr: SocketAddr) {
         if self.membership.contains_key(&peer_id) {
             return;
@@ -249,34 +308,15 @@ impl Server {
     }
 
     fn process_gossip(&mut self, rumor: &Rumor) {
-        match &rumor.kind {
-            RumorKind::Alive(addr) => {
-                if rumor.peer_id == self.id && rumor.incarnation >= self.incarnation {
-                    self.incarnation += 1;
-                    return;
-                }
-                if let Some(peer) = self.membership.get_mut(&rumor.peer_id) {
-                    if rumor.incarnation < peer.incarnation {
-                        return;
-                    }
-                    if peer.state == PeerState::Failed {
-                        // we actually have to probe them now
-                        let mut rng = thread_rng();
-                        let n: usize = rng.gen_range(0..=self.memberlist.len());
-                        self.memberlist.insert(n, peer.id);
-                    }
-                    if peer.state == PeerState::Suspect {
-                        info!("{:03} marking {:03} as Alive", self.id, peer);
-                        peer.state = PeerState::Alive;
-                    }
-                    peer.incarnation = rumor.incarnation;
-                } else {
-                    self.remember(rumor.peer_id, *addr, rumor.incarnation, PeerState::Alive);
-                }
-                self.broadcasts.push(*rumor);
+        if rumor.peer_id == self.id {
+            if rumor.incarnation < self.incarnation {
+                return;
             }
-            RumorKind::Suspect => {
-                if rumor.peer_id == self.id && rumor.incarnation >= self.incarnation {
+            match &rumor.kind {
+                RumorKind::Alive(_) => {
+                    self.incarnation += 1;
+                }
+                RumorKind::Suspect | RumorKind::Failed => {
                     // Reports of my death have been greatly exaggerated.
                     self.incarnation = self.incarnation.wrapping_add(1);
                     self.broadcasts.push(Rumor {
@@ -284,42 +324,10 @@ impl Server {
                         incarnation: self.incarnation,
                         kind: RumorKind::Alive(self.addr),
                     });
-                } else if let Some(peer) = self.membership.get_mut(&rumor.peer_id) {
-                    if rumor.incarnation >= peer.incarnation {
-                        if peer.state != PeerState::Suspect {
-                            info!("{:03} marking {:03} as Suspect", self.id, peer);
-                        }
-                        peer.state = PeerState::Suspect;
-                        peer.incarnation = rumor.incarnation;
-                        self.broadcasts.push(*rumor);
-                    }
                 }
             }
-            RumorKind::Failed => {
-                if rumor.peer_id == self.id && rumor.incarnation >= self.incarnation {
-                    self.incarnation = self.incarnation.wrapping_add(1);
-                    self.broadcasts.push(Rumor {
-                        peer_id: self.id,
-                        incarnation: self.incarnation,
-                        kind: RumorKind::Alive(self.addr),
-                    });
-                } else if let Some(peer) = self.membership.get_mut(&rumor.peer_id) {
-                    if rumor.incarnation < peer.incarnation {
-                        return;
-                    }
-                    warn!("{:03} marking {:03} as Failed", self.id, peer);
-                    let mut idx = usize::MAX;
-                    for (i, n) in self.memberlist.iter().enumerate() {
-                        if *n == rumor.peer_id {
-                            idx = i;
-                            break;
-                        }
-                    }
-                    assert!(idx != usize::MAX);
-                    self.memberlist.swap_remove(idx);
-                    self.broadcasts.push(*rumor);
-                }
-            }
+        } else {
+            self.upsert_peer(rumor.peer_id, rumor.incarnation, rumor.kind);
         }
     }
 
@@ -345,6 +353,7 @@ impl Server {
         msgs
     }
 
+    // TODO: return a response
     pub fn process(&mut self, msg: Message) {
         self.incarnation += 1;
         assert_eq!(
@@ -352,17 +361,19 @@ impl Server {
             "Simulator bug; sent {:?} to the wrong node",
             msg
         );
-        self.remember(msg.sender_id, msg.sender, 0, PeerState::Alive);
+        self.upsert_peer(msg.sender_id, 0, RumorKind::Alive(msg.sender));
         match msg.kind {
             MsgKind::Push(peers) => {
                 // Merge with our state
                 for peer in peers {
-                    self.remember(peer.id, peer.addr, peer.incarnation, peer.state)
+                    if peer.id != self.id {
+                        self.upsert_peer(peer.id, peer.incarnation, peer.rumor_kind())
+                    }
                 }
             }
             MsgKind::Pull(peers) => {
                 // Respond with our state in a Push
-                let our_peers = self.current_membership();
+                let our_peers = self.live_members();
                 let m = Message {
                     protocol_version: PROTOCOL_VERSION,
                     recipient: msg.sender_id,
@@ -373,23 +384,18 @@ impl Server {
                     gossip: self.gossip(),
                 };
                 self.outbox.push(m);
+                // TODO what if they think we're suspect?
                 for peer in peers {
-                    self.remember(peer.id, peer.addr, peer.incarnation, peer.state)
+                    if peer.id != self.id {
+                        self.upsert_peer(peer.id, peer.incarnation, peer.rumor_kind())
+                    }
                 }
             }
             MsgKind::Ping => {
                 self.ack(self.id, msg.sender_id);
             }
             MsgKind::PingReq { target_id, target } => {
-                if target_id == self.id {
-                    error!(
-                        "{:03} asked to ping-req itself by {:03}",
-                        self.id, msg.sender_id
-                    );
-                    self.ack(self.id, msg.sender_id);
-                } else {
-                    self.ping(target_id, target, msg.sender_id);
-                }
+                self.ping(target_id, target, msg.sender_id);
             }
             MsgKind::Ack(peer_id, incarnation) => {
                 if !self.pings.contains_key(&peer_id) {
@@ -409,24 +415,7 @@ impl Server {
                     self.ack(peer_id, requester);
                 }
 
-                if let Some(peer) = self.membership.get_mut(&peer_id) {
-                    if peer.state != PeerState::Failed && incarnation >= peer.incarnation {
-                        peer.state = PeerState::Alive;
-                        peer.incarnation = incarnation;
-                        self.broadcasts.push(Rumor {
-                            peer_id,
-                            incarnation,
-                            kind: RumorKind::Alive(peer.addr),
-                        });
-                    }
-                } else {
-                    self.remember(peer_id, addr, incarnation, PeerState::Alive);
-                    self.broadcasts.push(Rumor {
-                        peer_id,
-                        incarnation,
-                        kind: RumorKind::Alive(addr),
-                    });
-                }
+                self.upsert_peer(peer_id, incarnation, RumorKind::Alive(addr));
             }
         };
 
@@ -435,6 +424,7 @@ impl Server {
         }
     }
 
+    /// Called once per protocol period
     pub fn tick(&mut self) -> Vec<Message> {
         if self.last_pinged >= self.memberlist.len() {
             let mut rng = thread_rng();
