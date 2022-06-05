@@ -7,7 +7,7 @@ use rand::prelude::*;
 use rand::thread_rng;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use swimmer::{Message, Server};
+use surf::{Message, Server};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
