@@ -12,8 +12,7 @@ use rand::prelude::*;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::{
-    cmp::Ordering,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fmt::Display,
     mem::take,
     net::SocketAddr,
@@ -231,6 +230,7 @@ impl Server {
     }
 
     /// Join a cluster the specified peer belongs to
+    /// FIXME tie messages to addresses
     pub fn join(&mut self, peer_id: usize, addr: SocketAddr) {
         if self.membership.contains_key(&peer_id) {
             return;
@@ -543,7 +543,7 @@ impl Server {
 }
 
 #[cfg(test)]
-mod server_tests {
+mod tests {
     use super::*;
 
     #[test]

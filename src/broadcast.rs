@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 
 use crate::rumor::*;
@@ -14,13 +14,15 @@ pub struct Broadcast {
 
 impl PartialOrd for Broadcast {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        if self.sends < other.sends {
-            Some(Ordering::Less)
-        } else if self.serialized.len() > other.serialized.len() {
-            Some(Ordering::Less)
-        } else {
-            Some(self.id.cmp(&other.id))
+        match self.sends.cmp(&other.sends) {
+            Ordering::Equal => {}
+            ord => return Some(ord),
         }
+        match self.serialized.len().cmp(&other.serialized.len()) {
+            Ordering::Equal => {}
+            ord => return Some(ord),
+        }
+        Some(Reverse(self.id).cmp(&Reverse(other.id)))
     }
 }
 
@@ -97,5 +99,26 @@ impl BroadcastStore {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dont_enqueue_duplicates() {
+        todo!()
+    }
+
+    #[test]
+    fn test_broadcast_old_news() {
+        todo!()
+    }
+
+    #[test]
+    fn test_broadcast_ordering() {
+        // Fewest sends, then largest size, then newest message
+        todo!()
     }
 }
