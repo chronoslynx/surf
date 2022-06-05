@@ -61,32 +61,40 @@ fn main() {
             )
         })
         .collect();
-    for id in 1..args.n {
-        nodes.get_mut(&id).unwrap().join(
-            0,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), base_port),
-        );
-    }
+    let mut messages: Vec<(usize, Message)> = (1..args.n)
+        .map(|id| {
+            (
+                id,
+                nodes.get_mut(&id).unwrap().join(
+                    0,
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), base_port),
+                ),
+            )
+        })
+        .map(|(id, opt)| (id, opt.unwrap()))
+        .collect();
+
     info!("Created cluster of {} nodes", args.n);
-    let mut messages: Vec<(usize, Message)> = Vec::new();
     let mut rng = thread_rng();
     loop {
         let mut next_msgs = Vec::new();
+        for node in nodes.values_mut() {
+            for msg in node.tick().into_iter() {
+                next_msgs.push((node.id, msg));
+            }
+        }
         for (sender, msg) in messages.into_iter() {
             if rng.gen::<f32>() < args.p_delay {
-                trace!("{:03} -- {:?} -? {:03}", sender, msg.kind, msg.recipient);
+                trace!("{:03} -- {:?} -? {:03}", sender, msg.kind, msg.dest_id);
                 next_msgs.push((sender, msg));
                 continue;
             } else if rng.gen::<f32>() < args.p_loss {
-                trace!("{:03} -- {:?} -X {:03}", sender, msg.kind, msg.recipient);
+                trace!("{:03} -- {:?} -X {:03}", sender, msg.kind, msg.dest_id);
                 continue;
             }
-            trace!("{:03} -- {:?} -> {:03}", sender, msg.kind, msg.recipient);
-            let node = nodes.get_mut(&msg.recipient).unwrap();
-            node.process(msg);
-        }
-        for node in nodes.values_mut() {
-            for msg in node.tick().into_iter() {
+            trace!("{:03} -- {:?} -> {:03}", sender, msg.kind, msg.dest_id);
+            let node = nodes.get_mut(&msg.dest_id).unwrap();
+            if let Some(msg) = node.process(msg) {
                 next_msgs.push((node.id, msg));
             }
         }
