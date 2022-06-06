@@ -79,6 +79,10 @@ impl BroadcastStore {
         self.next_broadcast = self.next_broadcast.wrapping_add(1);
     }
 
+    pub fn push_broadcast(&mut self, broadcast: Broadcast) {
+        self.queue.push(broadcast);
+    }
+
     pub fn pop(&mut self) -> Option<Broadcast> {
         while let Some(bc) = self.queue.pop() {
             let (latest_id, _) = self.broadcasting.get(&bc.peer_id).unwrap();

@@ -100,8 +100,6 @@ impl fmt::Display for Peer {
     }
 }
 
-const PIGGYBACKED_MSGS: usize = 10;
-
 /// Failure Detector messages. These piggy-back higher level data
 #[derive(Debug)]
 pub enum MsgKind {
@@ -320,29 +318,37 @@ impl Server {
         }
     }
 
-    /// Return the hottest rumor we're aware of
-    pub fn gossip(&mut self, space_remaining: usize) -> Option<Rumor> {
-        let mut msgs = Vec::new();
+    /// Append as many rumors as we can into the provided buffer.
+    /// Returns the number of rumors inserted.
+    pub fn gossip(&mut self, buffer: &mut [u8]) -> usize {
         let n = (self.membership.len() + 2) as f32;
         let max_sends = 3 * n.log10().ceil() as u32;
-        // From the SWIM paper
-        self.suspicion_period = self.protocol_period * max_sends;
-        loop {
-            if let Some(broadcast) = self.broadcasts.pop() {}
-        }
-        // FIXME peek and check size first
-        while msgs.len() < PIGGYBACKED_MSGS {
-            if let Some(update) = self.broadcasts.pop() {
-                let dm = update.rumor;
-                if update.sends < (max_sends as usize - 1) {
-                    self.broadcasts.replay(update);
+        let mut tmp: Vec<Broadcast> = Vec::new();
+        let mut rumors = 0;
+        let mut idx = 0;
+        while idx < buffer.len() {
+            if buffer.len() - idx < SMALLEST_RUMOR {
+                break;
+            }
+            if let Some(broadcast) = self.broadcasts.pop() {
+                if broadcast.message.len() <= buffer.len() - idx {
+                    buffer[idx..idx + broadcast.message.len()].copy_from_slice(&broadcast.message);
+                    idx += broadcast.message.len();
+                    rumors += 1;
+                    if broadcast.sends < (max_sends as usize - 1) {
+                        self.broadcasts.replay(broadcast);
+                    }
+                } else {
+                    tmp.push(broadcast);
                 }
-                msgs.push(dm);
             } else {
                 break;
             }
         }
-        msgs
+        for bc in tmp {
+            self.broadcasts.push_broadcast(bc);
+        }
+        rumors
     }
 
     // TODO: return a response

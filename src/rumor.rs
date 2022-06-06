@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq)]
 pub enum DeserializationError {
     #[error("at least {0} more bytes necessary")]
     TooSmall(usize),
@@ -51,7 +51,7 @@ impl RumorKind {
 
     /// # Safety
     /// It's expected that you've already ensured the slice isn't empty.
-    pub fn from_slice(bytes: &[u8]) -> Result<RumorKind, DeserializationError> {
+    pub fn deserialize(bytes: &[u8]) -> Result<RumorKind, DeserializationError> {
         match bytes[0] {
             1 => Ok(RumorKind::Suspect),
             2 => Ok(RumorKind::Failed),
@@ -61,7 +61,7 @@ impl RumorKind {
                     // tag + v4 + u16 sockaddr
                     return Err(DeserializationError::TooSmall(8 - bytes.len()));
                 }
-                let octets: [u8; 4] = Default::default();
+                let mut octets: [u8; 4] = Default::default();
                 let (addr_bytes, rest) = bytes[1..].split_at(4);
                 octets.clone_from_slice(addr_bytes);
                 let ip = Ipv4Addr::from(octets);
@@ -77,7 +77,7 @@ impl RumorKind {
                     return Err(DeserializationError::V6TooSmall(27 - bytes.len()));
                 }
 
-                let octets: [u8; 16] = Default::default();
+                let mut octets: [u8; 16] = Default::default();
                 let (addr_bytesab, rest) = bytes[1..].split_at(16);
                 octets.clone_from_slice(addr_bytesab);
                 let ip = Ipv6Addr::from(octets);
@@ -88,7 +88,7 @@ impl RumorKind {
                 let (fb, rest) = rest.split_at(4);
                 let fi = u32::from_le_bytes(fb.try_into().unwrap());
 
-                let (sb, rest) = rest.split_at(4);
+                let (sb, _) = rest.split_at(4);
                 let si = u32::from_le_bytes(sb.try_into().unwrap());
                 Ok(RumorKind::Alive(SocketAddr::V6(SocketAddrV6::new(
                     ip, port, fi, si,
@@ -131,22 +131,34 @@ pub struct Rumor {
     pub kind: RumorKind,
 }
 
-const SMALLEST_RUMOR: usize = mem::size_of::<usize>() * 2 + 1;
+pub const SMALLEST_RUMOR: usize = mem::size_of::<usize>() * 2 + 1;
 
 impl Rumor {
-    fn from_bytes(bytes: &[u8]) -> Result<Rumor, DeserializationError> {
+    pub fn deserialize(bytes: &[u8]) -> Result<Rumor, DeserializationError> {
         if bytes.len() < SMALLEST_RUMOR {
             return Err(DeserializationError::TooSmall(SMALLEST_RUMOR));
         }
-        todo!()
+        let (pb, rest) = bytes[0..].split_at(mem::size_of::<usize>());
+        let peer_id = usize::from_le_bytes(pb.try_into().unwrap());
+
+        let (ib, rest) = rest.split_at(mem::size_of::<usize>());
+        let incarnation = usize::from_le_bytes(ib.try_into().unwrap());
+
+        let kind = RumorKind::deserialize(rest)?;
+        Ok(Rumor {
+            peer_id,
+            incarnation,
+            kind,
+        })
     }
 
     /// rumors are serialized as:
     /// peer_id, incarnation, rumor_kind_tag, rumor_kind_value
-    fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(SMALLEST_RUMOR);
         buf.extend_from_slice(&self.peer_id.to_le_bytes());
         buf.extend_from_slice(&self.incarnation.to_le_bytes());
+        self.kind.serialize(&mut buf);
 
         buf
     }
@@ -213,5 +225,39 @@ mod rumor_tests {
         };
         assert_eq!(failed2.partial_cmp(&alive3), Some(Ordering::Less));
         assert_eq!(failed2.partial_cmp(&sus2), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn test_serialize_deserialize() {
+        let rumors = [
+            Rumor {
+                peer_id: 1,
+                kind: RumorKind::Alive(sockaddr()),
+                incarnation: 1,
+            },
+            Rumor {
+                peer_id: 1,
+                kind: RumorKind::Alive(SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                    8080,
+                    13,
+                    89,
+                ))),
+                incarnation: 1,
+            },
+            Rumor {
+                peer_id: 99,
+                kind: RumorKind::Suspect,
+                incarnation: 12,
+            },
+            Rumor {
+                peer_id: 2,
+                kind: RumorKind::Suspect,
+                incarnation: 3,
+            },
+        ];
+        for rumor in rumors {
+            assert_eq!(Ok(rumor), Rumor::deserialize(&rumor.serialize()));
+        }
     }
 }
