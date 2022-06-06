@@ -124,10 +124,6 @@ pub struct Message {
     pub src_addr: SocketAddr,
     pub seq_no: usize,
     pub kind: MsgKind,
-    // FIXME separate this from the failure detector messages
-    // Gossip shuold be pulled by whatever does the networking work...
-    // so it can manage packing
-    pub gossip: Vec<Rumor>,
 }
 
 pub struct Server {
@@ -190,7 +186,6 @@ impl Server {
             src_addr: self.addr,
             seq_no: self.seq_no,
             kind: MsgKind::Ack(node, self.incarnation),
-            gossip: self.gossip(),
         }
     }
 
@@ -224,8 +219,6 @@ impl Server {
             src_addr: self.addr,
             seq_no: self.seq_no,
             kind: MsgKind::Ping,
-            // TODO: if node is `suspect` then spread that gossip!
-            gossip: self.gossip(),
         }
     }
 
@@ -300,11 +293,10 @@ impl Server {
             src_addr: self.addr,
             seq_no: 0,
             kind: MsgKind::Pull(Vec::new()),
-            gossip: Vec::new(),
         })
     }
 
-    fn process_gossip(&mut self, rumor: &Rumor) {
+    pub fn process_gossip(&mut self, rumor: &Rumor) {
         if rumor.peer_id != self.id {
             self.upsert_peer(rumor.peer_id, rumor.incarnation, rumor.kind);
             return;
@@ -328,14 +320,16 @@ impl Server {
         }
     }
 
-    // FIXME: only provide rumors up to a certain byte boundary
-    /// Return the hottest item of gossip we're aware of
-    pub fn gossip(&mut self) -> Vec<Rumor> {
+    /// Return the hottest rumor we're aware of
+    pub fn gossip(&mut self, space_remaining: usize) -> Option<Rumor> {
         let mut msgs = Vec::new();
         let n = (self.membership.len() + 2) as f32;
         let max_sends = 3 * n.log10().ceil() as u32;
         // From the SWIM paper
         self.suspicion_period = self.protocol_period * max_sends;
+        loop {
+            if let Some(broadcast) = self.broadcasts.pop() {}
+        }
         // FIXME peek and check size first
         while msgs.len() < PIGGYBACKED_MSGS {
             if let Some(update) = self.broadcasts.pop() {
@@ -387,7 +381,6 @@ impl Server {
                     src_addr: self.addr,
                     seq_no: 0,
                     kind: MsgKind::Push(our_peers),
-                    gossip: self.gossip(),
                 })
             }
             MsgKind::Ping => Some(self.ack(self.id, msg.src_id, msg.src_addr)),
@@ -416,10 +409,6 @@ impl Server {
             }
         };
 
-        for rumor in msg.gossip.iter() {
-            self.process_gossip(rumor);
-        }
-
         resp
     }
 
@@ -439,12 +428,15 @@ impl Server {
             src_addr: self.addr,
             seq_no: 0,
             kind: MsgKind::Pull(self.live_members()),
-            gossip: self.gossip(),
         })
     }
 
     /// Called once per protocol period
     pub fn tick(&mut self) -> Vec<Message> {
+        // From the SWIM paper
+        self.suspicion_period =
+            self.protocol_period * 3 * ((self.membership.len() + 2) as f32).log10().ceil() as u32;
+
         if self.last_pinged >= self.memberlist.len() {
             let mut rng = thread_rng();
             self.memberlist.shuffle(&mut rng);
@@ -524,7 +516,6 @@ impl Server {
                                 target_id: *node,
                                 target: ping.addr,
                             },
-                            gossip: self.gossip(),
                         };
                         outbox.push(m);
                     }

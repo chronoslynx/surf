@@ -5,11 +5,10 @@ use crate::rumor::*;
 
 #[derive(PartialEq, Eq)]
 pub struct Broadcast {
-    // TODO store serialized rumor only
-    pub rumor: Rumor,
-    pub serialized: Vec<u8>,
     pub id: usize,
+    pub peer_id: usize,
     pub sends: usize,
+    pub message: Vec<u8>,
 }
 
 impl PartialOrd for Broadcast {
@@ -18,7 +17,7 @@ impl PartialOrd for Broadcast {
             Ordering::Equal => {}
             ord => return Some(ord),
         }
-        match self.serialized.len().cmp(&other.serialized.len()) {
+        match self.message.len().cmp(&other.message.len()) {
             Ordering::Equal => {}
             ord => return Some(ord),
         }
@@ -38,7 +37,7 @@ pub struct BroadcastStore {
     // Current messages we're broadcasting. Used to dedupe
     // on replay
     // Rumors are small so I don't care that we're storing them twice
-    broadcasting: HashMap<usize, Rumor>,
+    broadcasting: HashMap<usize, (usize, Rumor)>,
     next_broadcast: usize,
 }
 
@@ -57,21 +56,23 @@ impl BroadcastStore {
     }
 
     pub fn push(&mut self, rumor: Rumor) {
-        if let Some(cur_rumor) = self.broadcasting.get_mut(&rumor.peer_id) {
+        if let Some((rumor_id, cur_rumor)) = self.broadcasting.get_mut(&rumor.peer_id) {
             assert_eq!(cur_rumor.peer_id, rumor.peer_id);
             if let Some(Ordering::Greater) = rumor.partial_cmp(cur_rumor) {
+                *rumor_id = self.next_broadcast;
                 *cur_rumor = rumor;
             } else {
                 // Old news
                 return;
             }
         } else {
-            self.broadcasting.insert(rumor.peer_id, rumor);
+            self.broadcasting
+                .insert(rumor.peer_id, (self.next_broadcast, rumor));
         }
         self.queue.push(Broadcast {
-            rumor,
-            // TODO: serialize rumor
-            serialized: Vec::new(),
+            peer_id: rumor.peer_id,
+            // FIXME: serialize rumor
+            message: Vec::new(),
             sends: 0,
             id: self.next_broadcast,
         });
@@ -80,22 +81,11 @@ impl BroadcastStore {
 
     pub fn pop(&mut self) -> Option<Broadcast> {
         while let Some(bc) = self.queue.pop() {
-            let latest = self.broadcasting.get(&bc.rumor.peer_id).unwrap();
-            match bc.rumor.partial_cmp(latest) {
-                Some(Ordering::Greater) => panic!(
-                    "Bug! broadcasting rumor {:?} newer than latest tracked {:?}",
-                    bc.rumor, latest
-                ),
-                Some(Ordering::Equal) => {
-                    return Some(bc);
-                }
-                Some(Ordering::Less) => {
-                    continue;
-                }
-                None => panic!(
-                    "Bug! should have ordering between {:?} and {:?}",
-                    bc.rumor, latest
-                ),
+            let (latest_id, _) = self.broadcasting.get(&bc.peer_id).unwrap();
+            if bc.id >= *latest_id {
+                return Some(bc);
+            } else {
+                return None;
             }
         }
         None
