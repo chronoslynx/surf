@@ -3,10 +3,10 @@ use std::collections::{BinaryHeap, HashMap};
 
 use crate::rumor::*;
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Broadcast {
     pub id: usize,
-    pub peer_id: usize,
+    pub peer_id: u64,
     pub sends: usize,
     pub message: Vec<u8>,
 }
@@ -37,7 +37,7 @@ pub struct BroadcastStore {
     // Current messages we're broadcasting. Used to dedupe
     // on replay
     // Rumors are small so I don't care that we're storing them twice
-    broadcasting: HashMap<usize, (usize, Rumor)>,
+    broadcasting: HashMap<u64, (usize, Rumor)>,
     next_broadcast: usize,
 }
 
@@ -71,8 +71,7 @@ impl BroadcastStore {
         }
         self.queue.push(Broadcast {
             peer_id: rumor.peer_id,
-            // FIXME: serialize rumor
-            message: Vec::new(),
+            message: rumor.serialize(),
             sends: 0,
             id: self.next_broadcast,
         });

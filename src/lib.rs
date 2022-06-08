@@ -5,7 +5,7 @@ mod broadcast;
 mod rumor;
 
 pub use broadcast::*;
-use rumor::*;
+pub use rumor::*;
 
 use core::fmt;
 use rand::prelude::*;
@@ -32,7 +32,7 @@ enum PingState {
 struct PendingPing {
     addr: SocketAddr,
     seq_no: usize,
-    requester: usize,
+    requester: u64,
     state: PingState,
     sent_at: Instant,
 }
@@ -56,14 +56,14 @@ impl From<RumorKind> for PeerState {
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub struct Peer {
-    id: usize,
+    id: u64,
     addr: SocketAddr,
     state: PeerState,
-    incarnation: usize,
+    incarnation: u64,
 }
 
 impl Peer {
-    fn new(id: usize, addr: SocketAddr, incarnation: usize, state: PeerState) -> Peer {
+    fn new(id: u64, addr: SocketAddr, incarnation: u64, state: PeerState) -> Peer {
         Peer {
             id,
             addr,
@@ -104,11 +104,8 @@ impl fmt::Display for Peer {
 #[derive(Debug)]
 pub enum MsgKind {
     Ping,
-    Ack(usize, usize),
-    PingReq {
-        target_id: usize,
-        target: SocketAddr,
-    },
+    Ack(u64, u64),
+    PingReq { target_id: u64, target: SocketAddr },
     Push(Vec<Peer>),
     Pull(Vec<Peer>),
 }
@@ -116,30 +113,30 @@ pub enum MsgKind {
 #[derive(Debug)]
 pub struct Message {
     pub protocol_version: u16,
-    pub dest_id: usize,
+    pub dest_id: u64,
     pub dest_addr: SocketAddr,
-    pub src_id: usize,
+    pub src_id: u64,
     pub src_addr: SocketAddr,
     pub seq_no: usize,
     pub kind: MsgKind,
 }
 
 pub struct Server {
-    pub id: usize,
+    pub id: u64,
     addr: SocketAddr,
     seq_no: usize,
-    incarnation: usize,
+    incarnation: u64,
     pingreq_subgroup_sz: usize,
     ping_interval: Duration,
     protocol_period: Duration,
     suspicion_period: Duration,
     broadcasts: BroadcastStore,
-    pings: HashMap<usize, PendingPing>,
+    pings: HashMap<u64, PendingPing>,
     // Index into memberlist
     last_pinged: usize,
-    memberlist: Vec<usize>,
+    memberlist: Vec<u64>,
     /// Node id -> (State, timestamp the state was updated)
-    membership: HashMap<usize, Peer>,
+    membership: HashMap<u64, Peer>,
 }
 
 impl Display for Server {
@@ -150,7 +147,7 @@ impl Display for Server {
 
 impl Server {
     pub fn new(
-        id: usize,
+        id: u64,
         addr: SocketAddr,
         ping_interval: Duration,
         pingreq_subgroup_sz: usize,
@@ -174,7 +171,7 @@ impl Server {
         }
     }
 
-    fn ack(&mut self, node: usize, dest_id: usize, dest_addr: SocketAddr) -> Message {
+    fn ack(&mut self, node: u64, dest_id: u64, dest_addr: SocketAddr) -> Message {
         self.seq_no = self.seq_no.wrapping_add(1);
         Message {
             protocol_version: PROTOCOL_VERSION,
@@ -187,7 +184,7 @@ impl Server {
         }
     }
 
-    fn ping(&mut self, target_id: usize, target_addr: SocketAddr, recipient: usize) -> Message {
+    fn ping(&mut self, target_id: u64, target_addr: SocketAddr, recipient: u64) -> Message {
         assert_ne!(target_id, self.id, "Attempted to ping ourselves");
         self.seq_no = self.seq_no.wrapping_add(1);
         let state = if recipient != self.id {
@@ -231,7 +228,7 @@ impl Server {
     }
 
     /// Apply new information to the specified peer state machine.
-    fn upsert_peer(&mut self, peer_id: usize, incarnation: usize, rumor_kind: RumorKind) {
+    fn upsert_peer(&mut self, peer_id: u64, incarnation: u64, rumor_kind: RumorKind) {
         assert_ne!(peer_id, self.id, "We should handle ourselves elsewhere");
         if let Some(peer) = self.membership.get_mut(&peer_id) {
             if incarnation < peer.incarnation {
@@ -278,7 +275,7 @@ impl Server {
     }
 
     /// Join a cluster the specified peer belongs to
-    pub fn join(&mut self, peer_id: usize, peer_addr: SocketAddr) -> Option<Message> {
+    pub fn join(&mut self, peer_id: u64, peer_addr: SocketAddr) -> Option<Message> {
         if self.membership.contains_key(&peer_id) {
             return None;
         }
@@ -294,7 +291,23 @@ impl Server {
         })
     }
 
-    pub fn process_gossip(&mut self, rumor: &Rumor) {
+    pub fn process_gossip(&mut self, buf: &[u8]) -> Result<(), DeserializationError> {
+        if buf.len() == 0 {
+            return Ok(());
+        }
+
+        let (count_bytes, mut rest) = buf.split_at(2);
+        let rumors = u16::from_le_bytes(count_bytes.try_into().unwrap());
+        for _ in 0..rumors {
+            let (rumor, sl) = Rumor::deserialize(rest)?;
+            trace!("{:03} heard {:?}", self.id, rumor);
+            self.process_rumor(rumor);
+            rest = sl;
+        }
+        Ok(())
+    }
+
+    pub fn process_rumor(&mut self, rumor: Rumor) {
         if rumor.peer_id != self.id {
             self.upsert_peer(rumor.peer_id, rumor.incarnation, rumor.kind);
             return;
@@ -319,18 +332,24 @@ impl Server {
     }
 
     /// Append as many rumors as we can into the provided buffer.
-    /// Returns the number of rumors inserted.
-    pub fn gossip(&mut self, buffer: &mut [u8]) -> usize {
+    pub fn gossip(&mut self, buffer: &mut [u8]) {
         let n = (self.membership.len() + 2) as f32;
         let max_sends = 3 * n.log10().ceil() as u32;
         let mut tmp: Vec<Broadcast> = Vec::new();
-        let mut rumors = 0;
-        let mut idx = 0;
+        let mut rumors: u16 = 0;
+        // First two bytes are for the number of rumors
+        let mut idx = 2;
         while idx < buffer.len() {
             if buffer.len() - idx < SMALLEST_RUMOR {
                 break;
             }
             if let Some(broadcast) = self.broadcasts.pop() {
+                assert_ne!(
+                    broadcast.message.len(),
+                    0,
+                    "invalid broadcast: {:?}",
+                    broadcast
+                );
                 if broadcast.message.len() <= buffer.len() - idx {
                     buffer[idx..idx + broadcast.message.len()].copy_from_slice(&broadcast.message);
                     idx += broadcast.message.len();
@@ -345,10 +364,10 @@ impl Server {
                 break;
             }
         }
+        buffer[0..2].copy_from_slice(&rumors.to_le_bytes());
         for bc in tmp {
             self.broadcasts.push_broadcast(bc);
         }
-        rumors
     }
 
     // TODO: return a response
@@ -531,7 +550,7 @@ impl Server {
         }
         self.pings = pings;
         for node in to_rm {
-            debug!("{:03} expire ping to {}", self.id, node);
+            trace!("{:03} expire ping to {}", self.id, node);
             self.pings.remove(&node);
         }
         if !self.membership.is_empty() {

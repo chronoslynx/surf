@@ -6,8 +6,9 @@ use humantime;
 use rand::prelude::*;
 use rand::thread_rng;
 use std::collections::HashMap;
+use std::iter::zip;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use surf::{Message, Server};
+use surf::{Message, Rumor, Server};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -43,12 +44,12 @@ fn main() {
     let ival: std::time::Duration = args.protocol_period.into();
     let sus_period = ival * 3 * ((args.n + 1) as f32).log10().ceil() as u32;
     let base_port: u16 = 32000;
-    let mut nodes: HashMap<usize, Server> = (0..args.n)
+    let mut nodes: HashMap<u64, Server> = (0..args.n)
         .map(|id| {
             (
-                id,
+                id as u64,
                 Server::new(
-                    id,
+                    id as u64,
                     SocketAddr::new(
                         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                         base_port + id as u16,
@@ -61,11 +62,11 @@ fn main() {
             )
         })
         .collect();
-    let mut messages: Vec<(usize, Message)> = (1..args.n)
+    let mut messages: Vec<(u64, Message)> = (1..args.n)
         .map(|id| {
             (
-                id,
-                nodes.get_mut(&id).unwrap().join(
+                id as u64,
+                nodes.get_mut(&(id as u64)).unwrap().join(
                     0,
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), base_port),
                 ),
@@ -73,17 +74,23 @@ fn main() {
         })
         .map(|(id, opt)| (id, opt.unwrap()))
         .collect();
+    // (# rumors, serialized rumors)
+    let mut gossip: Vec<[u8; 64]> = (1..args.n).map(|_| [0; 64]).collect();
 
     info!("Created cluster of {} nodes", args.n);
     let mut rng = thread_rng();
     loop {
         let mut next_msgs = Vec::new();
+        let mut next_gossip = Vec::new();
         for node in nodes.values_mut() {
             for msg in node.tick().into_iter() {
                 next_msgs.push((node.id, msg));
+                let mut goss = [0u8; 64];
+                node.gossip(&mut goss);
+                next_gossip.push(goss);
             }
         }
-        for (sender, msg) in messages.into_iter() {
+        for ((sender, msg), rumor_buf) in zip(messages, gossip) {
             if rng.gen::<f32>() < args.p_delay {
                 trace!("{:03} -- {:?} -? {:03}", sender, msg.kind, msg.dest_id);
                 next_msgs.push((sender, msg));
@@ -93,11 +100,19 @@ fn main() {
                 continue;
             }
             trace!("{:03} -- {:?} -> {:03}", sender, msg.kind, msg.dest_id);
-            let node = nodes.get_mut(&msg.dest_id).unwrap();
+            let dest = msg.dest_id;
+            let node = nodes.get_mut(&dest).unwrap();
             if let Some(msg) = node.process(msg) {
                 next_msgs.push((node.id, msg));
+                let mut goss = [0u8; 64];
+                node.gossip(&mut goss);
+                next_gossip.push(goss);
             }
+            node.process_gossip(&rumor_buf[..])
+                .expect("should process rumors");
         }
+
         messages = next_msgs;
+        gossip = next_gossip;
     }
 }

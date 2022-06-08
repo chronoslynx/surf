@@ -51,10 +51,11 @@ impl RumorKind {
 
     /// # Safety
     /// It's expected that you've already ensured the slice isn't empty.
-    pub fn deserialize(bytes: &[u8]) -> Result<RumorKind, DeserializationError> {
+    pub fn deserialize(bytes: &[u8]) -> Result<(RumorKind, &[u8]), DeserializationError> {
+        // FIXME: return `rest` here
         match bytes[0] {
-            1 => Ok(RumorKind::Suspect),
-            2 => Ok(RumorKind::Failed),
+            1 => Ok((RumorKind::Suspect, &bytes[1..])),
+            2 => Ok((RumorKind::Failed, &bytes[1..])),
             4 => {
                 // Alive v4
                 if bytes.len() < 7 {
@@ -65,11 +66,12 @@ impl RumorKind {
                 let (addr_bytes, rest) = bytes[1..].split_at(4);
                 octets.clone_from_slice(addr_bytes);
                 let ip = Ipv4Addr::from(octets);
-                let (port_bytes, _) = rest.split_at(2);
+                let (port_bytes, rest) = rest.split_at(2);
                 let port = u16::from_le_bytes(port_bytes.try_into().unwrap());
-                Ok(RumorKind::Alive(SocketAddr::V4(SocketAddrV4::new(
-                    ip, port,
-                ))))
+                Ok((
+                    RumorKind::Alive(SocketAddr::V4(SocketAddrV4::new(ip, port))),
+                    rest,
+                ))
             }
             6 => {
                 // Alive v6
@@ -88,11 +90,12 @@ impl RumorKind {
                 let (fb, rest) = rest.split_at(4);
                 let fi = u32::from_le_bytes(fb.try_into().unwrap());
 
-                let (sb, _) = rest.split_at(4);
+                let (sb, rest) = rest.split_at(4);
                 let si = u32::from_le_bytes(sb.try_into().unwrap());
-                Ok(RumorKind::Alive(SocketAddr::V6(SocketAddrV6::new(
-                    ip, port, fi, si,
-                ))))
+                Ok((
+                    RumorKind::Alive(SocketAddr::V6(SocketAddrV6::new(ip, port, fi, si))),
+                    rest,
+                ))
             }
             tag => Err(DeserializationError::InvalidRumor(tag)),
         }
@@ -126,30 +129,35 @@ impl PartialOrd for RumorKind {
 #[derive(PartialEq, Debug, Copy, Clone, Eq)]
 pub struct Rumor {
     /// ID of the peer this rumor is about
-    pub peer_id: usize,
-    pub incarnation: usize,
+    pub peer_id: u64,
+    pub incarnation: u64,
     pub kind: RumorKind,
 }
 
-pub const SMALLEST_RUMOR: usize = mem::size_of::<usize>() * 2 + 1;
+pub const SMALLEST_RUMOR: usize = mem::size_of::<u64>() * 2 + 1;
 
 impl Rumor {
-    pub fn deserialize(bytes: &[u8]) -> Result<Rumor, DeserializationError> {
+    /// Deserialize a rumor from a buffer, returning the Rumor itself and the unprocessed
+    /// slice of the buffer.
+    pub fn deserialize(bytes: &[u8]) -> Result<(Rumor, &[u8]), DeserializationError> {
         if bytes.len() < SMALLEST_RUMOR {
             return Err(DeserializationError::TooSmall(SMALLEST_RUMOR));
         }
-        let (pb, rest) = bytes[0..].split_at(mem::size_of::<usize>());
-        let peer_id = usize::from_le_bytes(pb.try_into().unwrap());
+        let (pb, rest) = bytes[0..].split_at(8);
+        let peer_id = u64::from_le_bytes(pb.try_into().unwrap());
 
-        let (ib, rest) = rest.split_at(mem::size_of::<usize>());
-        let incarnation = usize::from_le_bytes(ib.try_into().unwrap());
+        let (ib, rest) = rest.split_at(8);
+        let incarnation = u64::from_le_bytes(ib.try_into().unwrap());
 
-        let kind = RumorKind::deserialize(rest)?;
-        Ok(Rumor {
-            peer_id,
-            incarnation,
-            kind,
-        })
+        let (kind, rest) = RumorKind::deserialize(rest)?;
+        Ok((
+            Rumor {
+                peer_id,
+                incarnation,
+                kind,
+            },
+            rest,
+        ))
     }
 
     /// rumors are serialized as:
@@ -179,6 +187,7 @@ impl PartialOrd for Rumor {
 #[cfg(test)]
 mod rumor_tests {
     use super::*;
+    type TestResult<T = (), E = Box<dyn std::error::Error>> = Result<T, E>;
 
     fn sockaddr() -> SocketAddr {
         "127.0.0.1:8080".parse().unwrap()
@@ -228,10 +237,10 @@ mod rumor_tests {
     }
 
     #[test]
-    fn test_serialize_deserialize() {
+    fn test_serialize_deserialize() -> TestResult {
         let rumors = [
             Rumor {
-                peer_id: 1,
+                peer_id: 0,
                 kind: RumorKind::Alive(sockaddr()),
                 incarnation: 1,
             },
@@ -257,7 +266,78 @@ mod rumor_tests {
             },
         ];
         for rumor in rumors {
-            assert_eq!(Ok(rumor), Rumor::deserialize(&rumor.serialize()));
+            let (r, _) = Rumor::deserialize(&rumor.serialize())?;
+            assert_eq!(rumor, r);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize() -> TestResult {
+        let mut buf = [0u8; 50];
+        // [0, 8) are 0 for peer_id 0
+        // [8, 16) are incarnation 1
+        buf[8] = 1;
+        // u8 rumorkind tag. 4 for Alive IPv4
+        buf[16] = 4;
+        // 4 bytes for the octets
+        buf[17] = 127;
+        buf[18] = 0;
+        buf[19] = 0;
+        buf[20] = 1;
+        // 2 bytes for the port
+        buf[21..23].copy_from_slice(&(8080u16).to_le_bytes());
+        let (deser, _) = Rumor::deserialize(&buf)?;
+        assert_eq!(
+            Rumor {
+                peer_id: 0,
+                incarnation: 1,
+                kind: RumorKind::Alive(sockaddr()),
+            },
+            deser
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_many() -> TestResult {
+        let mut buf = [0u8; 80];
+        // two rumors
+        buf[0] = 2;
+        // peer 0
+        buf[2] = 0;
+        buf[10] = 1;
+        buf[18] = 4;
+        buf[19] = 127;
+        buf[20] = 0;
+        buf[21] = 0;
+        buf[22] = 1;
+        // 2 bytes for the port
+        buf[23..25].copy_from_slice(&(8080u16).to_le_bytes());
+        // second rumor
+        buf[25] = 1;
+        buf[33] = 3;
+        buf[41] = 1; // tag 1 is suspect
+
+        let (deser, rest) = Rumor::deserialize(&buf[2..])?;
+        assert_eq!(
+            Rumor {
+                peer_id: 0,
+                incarnation: 1,
+                kind: RumorKind::Alive(sockaddr()),
+            },
+            deser
+        );
+
+        let (deser, _) = Rumor::deserialize(&rest)?;
+        assert_eq!(
+            Rumor {
+                peer_id: 1,
+                incarnation: 3,
+                kind: RumorKind::Suspect,
+            },
+            deser
+        );
+        Ok(())
     }
 }
