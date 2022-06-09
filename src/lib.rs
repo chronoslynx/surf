@@ -21,6 +21,60 @@ use std::{
 
 const PROTOCOL_VERSION: u16 = 1;
 
+#[derive(Debug, PartialEq, Clone, Copy, Eq, Hash)]
+pub struct PeerId(u32);
+
+impl Display for PeerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PeerId({})", self.0)
+    }
+}
+
+impl PeerId {
+    pub fn serialize_to(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.0.to_le_bytes());
+    }
+
+    pub fn deserialize(bytes: [u8; 4]) -> Self {
+        PeerId(u32::from_le_bytes(bytes))
+    }
+}
+
+impl From<u32> for PeerId {
+    fn from(u: u32) -> Self {
+        Self(u)
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Copy, Eq, PartialOrd, Ord)]
+pub struct Incarnation(u32);
+
+impl Display for Incarnation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Incarnation({})", self.0)
+    }
+}
+
+impl Incarnation {
+    fn bump(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
+
+    pub fn serialize_to(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.0.to_le_bytes());
+    }
+
+    pub fn deserialize(bytes: [u8; 4]) -> Self {
+        Incarnation(u32::from_le_bytes(bytes))
+    }
+}
+
+impl From<u32> for Incarnation {
+    fn from(u: u32) -> Self {
+        Self(u)
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum PingState {
     Normal,
@@ -32,7 +86,7 @@ enum PingState {
 struct PendingPing {
     addr: SocketAddr,
     seq_no: usize,
-    requester: u64,
+    requester: PeerId,
     state: PingState,
     sent_at: Instant,
 }
@@ -56,14 +110,14 @@ impl From<RumorKind> for PeerState {
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub struct Peer {
-    id: u64,
+    id: PeerId,
     addr: SocketAddr,
     state: PeerState,
-    incarnation: u64,
+    incarnation: Incarnation,
 }
 
 impl Peer {
-    fn new(id: u64, addr: SocketAddr, incarnation: u64, state: PeerState) -> Peer {
+    fn new(id: PeerId, addr: SocketAddr, incarnation: Incarnation, state: PeerState) -> Peer {
         Peer {
             id,
             addr,
@@ -104,8 +158,11 @@ impl fmt::Display for Peer {
 #[derive(Debug)]
 pub enum MsgKind {
     Ping,
-    Ack(u64, u64),
-    PingReq { target_id: u64, target: SocketAddr },
+    Ack(PeerId, Incarnation),
+    PingReq {
+        target_id: PeerId,
+        target: SocketAddr,
+    },
     Push(Vec<Peer>),
     Pull(Vec<Peer>),
 }
@@ -113,30 +170,30 @@ pub enum MsgKind {
 #[derive(Debug)]
 pub struct Message {
     pub protocol_version: u16,
-    pub dest_id: u64,
+    pub dest_id: PeerId,
     pub dest_addr: SocketAddr,
-    pub src_id: u64,
+    pub src_id: PeerId,
     pub src_addr: SocketAddr,
     pub seq_no: usize,
     pub kind: MsgKind,
 }
 
 pub struct Server {
-    pub id: u64,
+    pub id: PeerId,
     addr: SocketAddr,
     seq_no: usize,
-    incarnation: u64,
+    incarnation: Incarnation,
     pingreq_subgroup_sz: usize,
     ping_interval: Duration,
     protocol_period: Duration,
     suspicion_period: Duration,
     broadcasts: BroadcastStore,
-    pings: HashMap<u64, PendingPing>,
+    pings: HashMap<PeerId, PendingPing>,
     // Index into memberlist
     last_pinged: usize,
-    memberlist: Vec<u64>,
+    memberlist: Vec<PeerId>,
     /// Node id -> (State, timestamp the state was updated)
-    membership: HashMap<u64, Peer>,
+    membership: HashMap<PeerId, Peer>,
 }
 
 impl Display for Server {
@@ -147,7 +204,7 @@ impl Display for Server {
 
 impl Server {
     pub fn new(
-        id: u64,
+        id: PeerId,
         addr: SocketAddr,
         ping_interval: Duration,
         pingreq_subgroup_sz: usize,
@@ -162,7 +219,7 @@ impl Server {
             protocol_period,
             suspicion_period,
             seq_no: 1,
-            incarnation: 1,
+            incarnation: Incarnation(1),
             broadcasts: BroadcastStore::new(),
             pings: HashMap::new(),
             last_pinged: 0,
@@ -171,7 +228,7 @@ impl Server {
         }
     }
 
-    fn ack(&mut self, node: u64, dest_id: u64, dest_addr: SocketAddr) -> Message {
+    fn ack(&mut self, node: PeerId, dest_id: PeerId, dest_addr: SocketAddr) -> Message {
         self.seq_no = self.seq_no.wrapping_add(1);
         Message {
             protocol_version: PROTOCOL_VERSION,
@@ -184,7 +241,7 @@ impl Server {
         }
     }
 
-    fn ping(&mut self, target_id: u64, target_addr: SocketAddr, recipient: u64) -> Message {
+    fn ping(&mut self, target_id: PeerId, target_addr: SocketAddr, recipient: PeerId) -> Message {
         assert_ne!(target_id, self.id, "Attempted to ping ourselves");
         self.seq_no = self.seq_no.wrapping_add(1);
         let state = if recipient != self.id {
@@ -228,7 +285,7 @@ impl Server {
     }
 
     /// Apply new information to the specified peer state machine.
-    fn upsert_peer(&mut self, peer_id: u64, incarnation: u64, rumor_kind: RumorKind) {
+    fn upsert_peer(&mut self, peer_id: PeerId, incarnation: Incarnation, rumor_kind: RumorKind) {
         assert_ne!(peer_id, self.id, "We should handle ourselves elsewhere");
         if let Some(peer) = self.membership.get_mut(&peer_id) {
             if incarnation < peer.incarnation {
@@ -275,7 +332,7 @@ impl Server {
     }
 
     /// Join a cluster the specified peer belongs to
-    pub fn join(&mut self, peer_id: u64, peer_addr: SocketAddr) -> Option<Message> {
+    pub fn join(&mut self, peer_id: PeerId, peer_addr: SocketAddr) -> Option<Message> {
         if self.membership.contains_key(&peer_id) {
             return None;
         }
@@ -316,12 +373,10 @@ impl Server {
             return;
         }
         match &rumor.kind {
-            RumorKind::Alive(_) => {
-                self.incarnation += 1;
-            }
+            RumorKind::Alive(_) => self.incarnation.bump(),
             RumorKind::Suspect | RumorKind::Failed => {
                 // Reports of my death have been greatly exaggerated.
-                self.incarnation = self.incarnation.wrapping_add(1);
+                self.incarnation.bump();
                 self.broadcasts.push(Rumor {
                     peer_id: self.id,
                     incarnation: self.incarnation,
@@ -372,13 +427,12 @@ impl Server {
 
     // TODO: return a response
     pub fn process(&mut self, msg: Message) -> Option<Message> {
-        self.incarnation += 1;
         assert_eq!(
             msg.dest_id, self.id,
             "Simulator bug; sent {:?} to the wrong node",
             msg
         );
-        self.upsert_peer(msg.src_id, 0, RumorKind::Alive(msg.src_addr));
+        self.upsert_peer(msg.src_id, Incarnation(0), RumorKind::Alive(msg.src_addr));
         let resp = match msg.kind {
             MsgKind::Push(peers) => {
                 // Merge with our state
@@ -514,7 +568,7 @@ impl Server {
                     .membership
                     .get(node)
                     .map(|p| p.incarnation)
-                    .unwrap_or(0);
+                    .unwrap_or(0.into());
                 if self.memberlist.len() <= 1 {
                     debug!("{:03} suspects that {:03} has failed", self.id, node);
                     to_rm.push(*node);

@@ -2,11 +2,12 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 
 use crate::rumor::*;
+use crate::PeerId;
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct Broadcast {
     pub id: usize,
-    pub peer_id: u64,
+    pub peer_id: PeerId,
     pub sends: usize,
     pub message: Vec<u8>,
 }
@@ -37,7 +38,7 @@ pub struct BroadcastStore {
     // Current messages we're broadcasting. Used to dedupe
     // on replay
     // Rumors are small so I don't care that we're storing them twice
-    broadcasting: HashMap<u64, (usize, Rumor)>,
+    broadcasting: HashMap<PeerId, (usize, Rumor)>,
     next_broadcast: usize,
 }
 

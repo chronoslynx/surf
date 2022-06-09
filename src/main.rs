@@ -8,14 +8,14 @@ use rand::thread_rng;
 use std::collections::HashMap;
 use std::iter::zip;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use surf::{Message, Rumor, Server};
+use surf::{Message, PeerId, Rumor, Server};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
     /// Initial cluster size
     #[clap(short, long, default_value_t = 13)]
-    n: usize,
+    n: u32,
 
     /// Failure detection subgroup size
     #[clap(short, long, default_value_t = 3)]
@@ -44,12 +44,12 @@ fn main() {
     let ival: std::time::Duration = args.protocol_period.into();
     let sus_period = ival * 3 * ((args.n + 1) as f32).log10().ceil() as u32;
     let base_port: u16 = 32000;
-    let mut nodes: HashMap<u64, Server> = (0..args.n)
+    let mut nodes: HashMap<PeerId, Server> = (0..args.n)
         .map(|id| {
             (
-                id as u64,
+                id.into(),
                 Server::new(
-                    id as u64,
+                    id.into(),
                     SocketAddr::new(
                         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                         base_port + id as u16,
@@ -62,12 +62,12 @@ fn main() {
             )
         })
         .collect();
-    let mut messages: Vec<(u64, Message)> = (1..args.n)
+    let mut messages: Vec<(PeerId, Message)> = (1..args.n)
         .map(|id| {
             (
-                id as u64,
-                nodes.get_mut(&(id as u64)).unwrap().join(
-                    0,
+                id.into(),
+                nodes.get_mut(&(id.into())).unwrap().join(
+                    0.into(),
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), base_port),
                 ),
             )

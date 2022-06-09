@@ -1,3 +1,4 @@
+use crate::{Incarnation, PeerId};
 use std::cmp::Ordering;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -26,7 +27,7 @@ pub enum RumorKind {
 }
 
 impl RumorKind {
-    pub fn serialize(&self, buf: &mut Vec<u8>) {
+    pub fn serialize_to(&self, buf: &mut Vec<u8>) {
         match self {
             RumorKind::Suspect => {
                 buf.extend_from_slice(&1u8.to_le_bytes());
@@ -129,12 +130,12 @@ impl PartialOrd for RumorKind {
 #[derive(PartialEq, Debug, Copy, Clone, Eq)]
 pub struct Rumor {
     /// ID of the peer this rumor is about
-    pub peer_id: u64,
-    pub incarnation: u64,
+    pub peer_id: PeerId,
+    pub incarnation: Incarnation,
     pub kind: RumorKind,
 }
 
-pub const SMALLEST_RUMOR: usize = mem::size_of::<u64>() * 2 + 1;
+pub const SMALLEST_RUMOR: usize = mem::size_of::<PeerId>() + mem::size_of::<Incarnation>() + 1;
 
 impl Rumor {
     /// Deserialize a rumor from a buffer, returning the Rumor itself and the unprocessed
@@ -143,11 +144,11 @@ impl Rumor {
         if bytes.len() < SMALLEST_RUMOR {
             return Err(DeserializationError::TooSmall(SMALLEST_RUMOR));
         }
-        let (pb, rest) = bytes[0..].split_at(8);
-        let peer_id = u64::from_le_bytes(pb.try_into().unwrap());
+        let (pb, rest) = bytes[0..].split_at(mem::size_of::<PeerId>());
+        let peer_id = PeerId::deserialize(pb.try_into().unwrap());
 
-        let (ib, rest) = rest.split_at(8);
-        let incarnation = u64::from_le_bytes(ib.try_into().unwrap());
+        let (ib, rest) = rest.split_at(mem::size_of::<Incarnation>());
+        let incarnation = Incarnation::deserialize(ib.try_into().unwrap());
 
         let (kind, rest) = RumorKind::deserialize(rest)?;
         Ok((
@@ -164,9 +165,9 @@ impl Rumor {
     /// peer_id, incarnation, rumor_kind_tag, rumor_kind_value
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(SMALLEST_RUMOR);
-        buf.extend_from_slice(&self.peer_id.to_le_bytes());
-        buf.extend_from_slice(&self.incarnation.to_le_bytes());
-        self.kind.serialize(&mut buf);
+        self.peer_id.serialize_to(&mut buf);
+        self.incarnation.serialize_to(&mut buf);
+        self.kind.serialize_to(&mut buf);
 
         buf
     }
@@ -187,6 +188,7 @@ impl PartialOrd for Rumor {
 #[cfg(test)]
 mod rumor_tests {
     use super::*;
+    use pretty_hex::*;
     type TestResult<T = (), E = Box<dyn std::error::Error>> = Result<T, E>;
 
     fn sockaddr() -> SocketAddr {
@@ -196,14 +198,14 @@ mod rumor_tests {
     #[test]
     fn test_only_cmp_same_peer() {
         let alive = Rumor {
-            peer_id: 1,
+            peer_id: 1.into(),
             kind: RumorKind::Alive(sockaddr()),
-            incarnation: 1,
+            incarnation: 1.into(),
         };
         let alive2 = Rumor {
-            peer_id: 2,
+            peer_id: 2.into(),
             kind: RumorKind::Alive(sockaddr()),
-            incarnation: 33,
+            incarnation: 33.into(),
         };
         assert_eq!(alive.partial_cmp(&alive2), None);
     }
@@ -211,26 +213,26 @@ mod rumor_tests {
     #[test]
     fn test_rumor_precedence_favors_incarnation_num() {
         let alive1 = Rumor {
-            peer_id: 1,
+            peer_id: 1.into(),
             kind: RumorKind::Alive(sockaddr()),
-            incarnation: 1,
+            incarnation: 1.into(),
         };
         let sus2 = Rumor {
-            peer_id: 1,
+            peer_id: 1.into(),
             kind: RumorKind::Suspect,
-            incarnation: 2,
+            incarnation: 2.into(),
         };
         assert_eq!(alive1.partial_cmp(&sus2), Some(Ordering::Less));
         let alive3 = Rumor {
-            peer_id: 1,
+            peer_id: 1.into(),
             kind: RumorKind::Alive(sockaddr()),
-            incarnation: 3,
+            incarnation: 3.into(),
         };
         assert_eq!(alive3.partial_cmp(&sus2), Some(Ordering::Greater));
         let failed2 = Rumor {
-            peer_id: 1,
+            peer_id: 1.into(),
             kind: RumorKind::Failed,
-            incarnation: 2,
+            incarnation: 2.into(),
         };
         assert_eq!(failed2.partial_cmp(&alive3), Some(Ordering::Less));
         assert_eq!(failed2.partial_cmp(&sus2), Some(Ordering::Greater));
@@ -240,29 +242,29 @@ mod rumor_tests {
     fn test_serialize_deserialize() -> TestResult {
         let rumors = [
             Rumor {
-                peer_id: 0,
+                peer_id: 0.into(),
                 kind: RumorKind::Alive(sockaddr()),
-                incarnation: 1,
+                incarnation: 1.into(),
             },
             Rumor {
-                peer_id: 1,
+                peer_id: 1.into(),
                 kind: RumorKind::Alive(SocketAddr::V6(SocketAddrV6::new(
                     Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
                     8080,
                     13,
                     89,
                 ))),
-                incarnation: 1,
+                incarnation: 1.into(),
             },
             Rumor {
-                peer_id: 99,
+                peer_id: 99.into(),
                 kind: RumorKind::Suspect,
-                incarnation: 12,
+                incarnation: 12.into(),
             },
             Rumor {
-                peer_id: 2,
+                peer_id: 2.into(),
                 kind: RumorKind::Suspect,
-                incarnation: 3,
+                incarnation: 3.into(),
             },
         ];
         for rumor in rumors {
@@ -274,70 +276,92 @@ mod rumor_tests {
 
     #[test]
     fn deserialize() -> TestResult {
-        let mut buf = [0u8; 50];
-        // [0, 8) are 0 for peer_id 0
-        // [8, 16) are incarnation 1
-        buf[8] = 1;
+        let mut buf = [0u8; 15];
+        // [0, 4) are 0 for peer_id 0
+        // [4, 8) are incarnation 1
+        buf[4] = 1;
         // u8 rumorkind tag. 4 for Alive IPv4
-        buf[16] = 4;
+        buf[8] = 4;
         // 4 bytes for the octets
-        buf[17] = 127;
-        buf[18] = 0;
-        buf[19] = 0;
-        buf[20] = 1;
+        buf[9] = 127;
+        buf[10] = 0;
+        buf[11] = 0;
+        buf[12] = 1;
         // 2 bytes for the port
-        buf[21..23].copy_from_slice(&(8080u16).to_le_bytes());
-        let (deser, _) = Rumor::deserialize(&buf)?;
-        assert_eq!(
-            Rumor {
-                peer_id: 0,
-                incarnation: 1,
-                kind: RumorKind::Alive(sockaddr()),
-            },
-            deser
-        );
-        Ok(())
+        buf[13..15].copy_from_slice(&(8080u16).to_le_bytes());
+        match Rumor::deserialize(&buf) {
+            Ok((deser, _)) => {
+                assert_eq!(
+                    Rumor {
+                        peer_id: 0.into(),
+                        incarnation: 1.into(),
+                        kind: RumorKind::Alive(sockaddr()),
+                    },
+                    deser,
+                    "Incorrectly parsed\n{:?}",
+                    pretty_hex(&buf)
+                );
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("Failed to parse rumor from\n{:?}", pretty_hex(&buf));
+                Err(e.into())
+            }
+        }
     }
 
     #[test]
     fn deserialize_many() -> TestResult {
-        let mut buf = [0u8; 80];
+        let mut buf = [0u8; 26];
         // two rumors
         buf[0] = 2;
         // peer 0
         buf[2] = 0;
-        buf[10] = 1;
-        buf[18] = 4;
-        buf[19] = 127;
-        buf[20] = 0;
-        buf[21] = 0;
-        buf[22] = 1;
+        buf[6] = 1;
+        buf[10] = 4;
+        buf[11] = 127;
+        buf[12] = 0;
+        buf[13] = 0;
+        buf[14] = 1;
         // 2 bytes for the port
-        buf[23..25].copy_from_slice(&(8080u16).to_le_bytes());
+        buf[15..17].copy_from_slice(&(8080u16).to_le_bytes());
         // second rumor
-        buf[25] = 1;
-        buf[33] = 3;
-        buf[41] = 1; // tag 1 is suspect
+        buf[17] = 1;
+        buf[21] = 3;
+        buf[25] = 1; // tag 1 is suspect
 
-        let (deser, rest) = Rumor::deserialize(&buf[2..])?;
-        assert_eq!(
-            Rumor {
-                peer_id: 0,
-                incarnation: 1,
-                kind: RumorKind::Alive(sockaddr()),
-            },
-            deser
-        );
+        let rest = Rumor::deserialize(&buf[2..])
+            .map(|(deser, rest)| {
+                assert_eq!(
+                    Rumor {
+                        peer_id: 0.into(),
+                        incarnation: 1.into(),
+                        kind: RumorKind::Alive(sockaddr()),
+                    },
+                    deser,
+                    "first rumor is incorrect"
+                );
+                rest
+            })
+            .map_err(|e| {
+                eprintln!("Failed to parse rumor from\n{:?}", pretty_hex(&buf));
+                e
+            })?;
 
-        let (deser, _) = Rumor::deserialize(&rest)?;
-        assert_eq!(
-            Rumor {
-                peer_id: 1,
-                incarnation: 3,
-                kind: RumorKind::Suspect,
-            },
-            deser
-        );
-        Ok(())
+        match Rumor::deserialize(&rest) {
+            Ok((deser, _)) => {
+                assert_eq!(
+                    Rumor {
+                        peer_id: 1.into(),
+                        incarnation: 3.into(),
+                        kind: RumorKind::Suspect,
+                    },
+                    deser,
+                    "second rumor is incorrect"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }
