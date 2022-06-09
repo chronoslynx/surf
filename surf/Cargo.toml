@@ -9,11 +9,7 @@ authors = ["Tim Deeb-Swihart <tim@deebswih.art>"]
 
 [dependencies]
 rand = "0.8.4"
-clap = { version = "3.1.18", features = ["derive"] }
-anyhow = "1.0.57"
 log = "0.4.0"
-env_logger = "0.8.4"
-humantime = "2.1.0"
 thiserror = "1.0.31"
 
 [dev-dependencies]

@@ -290,10 +290,6 @@ checksum = "73473c0e59e6d5812c5dfe2a064a6444949f089e20eec9a2e5506596494e4623"
 name = "surf"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "clap",
- "env_logger",
- "humantime",
  "log",
  "pretty-hex",
  "rand",
@@ -303,6 +299,15 @@ dependencies = [
 [[package]]
 name = "surfboard"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "humantime",
+ "log",
+ "rand",
+ "surf",
+]
 
 [[package]]
 name = "syn"
