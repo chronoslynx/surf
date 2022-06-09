@@ -1,0 +1,20 @@
+[package]
+name = "surf"
+description = "Cluster membership protocol based on SWIM and Lifeguard"
+version = "0.1.0"
+edition = "2021"
+authors = ["Tim Deeb-Swihart <tim@deebswih.art>"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rand = "0.8.4"
+clap = { version = "3.1.18", features = ["derive"] }
+anyhow = "1.0.57"
+log = "0.4.0"
+env_logger = "0.8.4"
+humantime = "2.1.0"
+thiserror = "1.0.31"
+
+[dev-dependencies]
+pretty-hex = "0.3.0"

@@ -629,52 +629,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_periodically_ping() {
+    fn tick_pings_random_peer() {
+        // FIXME ensure it doesn't pick dead peers
         todo!()
     }
 
     #[test]
-    fn test_periodically_pushpull() {
+    fn push_pull_only_chooses_live_peers() {
         todo!()
     }
 
     #[test]
-    fn test_pushpull() {
+    fn pushes_respond_to_pulls() {
         todo!()
     }
 
     #[test]
-    fn test_pings_are_acked() {
+    fn pulls_update_state() {
         todo!()
     }
 
     #[test]
-    fn test_pingreqs_beget_pings() {
+    fn pings_are_acked() {
         todo!()
     }
 
     #[test]
-    fn test_pingreq_acks_are_forwarded() {
+    fn pingreqs_beget_pings() {
         todo!()
     }
 
     #[test]
-    fn test_late_acks_are_suspect() {
+    fn pingreq_acks_are_forwarded() {
         todo!()
     }
 
     #[test]
-    fn test_timely_acks_clear_suspicion() {
+    fn late_acks_are_suspect() {
         todo!()
     }
 
     #[test]
-    fn test_recognize_failed_peer() {
+    fn timely_acks_clear_suspicion() {
         todo!()
     }
 
     #[test]
-    fn test_ignore_old_news() {
+    fn recognize_failed_peer() {
+        todo!()
+    }
+
+    #[test]
+    fn ignore_old_news() {
         todo!()
     }
 }

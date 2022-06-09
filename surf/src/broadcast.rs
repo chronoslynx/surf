@@ -101,13 +101,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dont_enqueue_duplicates() {
-        todo!()
-    }
-
-    #[test]
-    fn test_broadcast_old_news() {
-        todo!()
+    fn disregards_lesser_news() {
+        // We only keep the latest news for a given peer
+        let mut bs = BroadcastStore::new();
+        bs.push(Rumor {
+            peer_id: 1.into(),
+            incarnation: 1.into(),
+            kind: RumorKind::Suspect,
+        });
+        let alive = Rumor {
+            peer_id: 1.into(),
+            incarnation: 2.into(),
+            kind: RumorKind::Alive("127.0.0.1:8080".parse().unwrap()),
+        };
+        bs.push(alive);
+        assert_eq!(
+            bs.pop(),
+            Some(Broadcast {
+                peer_id: 1.into(),
+                message: alive.serialize(),
+                sends: 0,
+                id: 1,
+            })
+        );
+        // The suspect rumor is ignored as new news arrived
+        assert_eq!(bs.pop(), None);
     }
 
     #[test]
